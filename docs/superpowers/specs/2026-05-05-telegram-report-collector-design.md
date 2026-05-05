@@ -1,7 +1,7 @@
 # Telegram 증권 리포트 수집기 — 설계 문서
 
 - **작성일**: 2026-05-05
-- **대상 채널**: `samstudy1004` (Telegram 채널, broadcast 방식)
+- **대상 채널**: `sunstudy1004` (Telegram 채널, broadcast 방식)
 - **MVP 목표**: 사용자가 스크립트를 실행할 때마다, 직전 실행 이후 채널에 업로드된 PDF 리포트를 모두 수집하고 메타데이터를 Supabase에 기록한다.
 - **확장 방향**: 수집된 리포트에 대한 메타데이터 태깅 워커 추가 → 리서치 자료 분석 워크플로우 자동화 → 프론트엔드(리포트 자동 분석 서비스).
 
@@ -93,7 +93,7 @@ create table reports (
   -- 식별자
   id                bigserial primary key,
   message_id        bigint      not null,         -- Telegram 메시지 ID (chat 내에서 monotonic)
-  chat_username     text        not null,         -- 'samstudy1004' (멀티채널 확장 대비)
+  chat_username     text        not null,         -- 'sunstudy1004' (멀티채널 확장 대비)
 
   -- 시각 정보 (둘 다 UTC 저장; 표시 시 'Asia/Seoul' 변환)
   sent_at           timestamptz not null,         -- 메시지가 채널에 올라온 시각 (Telethon msg.date, UTC)
@@ -241,7 +241,7 @@ from datetime import datetime, timedelta, timezone
 
 cutoff = datetime.now(timezone.utc) - timedelta(days=config.initial_cutoff_days)
 async for msg in client.iter_messages(
-    'samstudy1004',
+    'sunstudy1004',
     offset_date=cutoff,
     reverse=True,
 ):
@@ -375,7 +375,7 @@ filename = 12345_삼성전자.pdf            # DB의 file_path 컬럼에 들어�
 ```python
 {
     'message_id':       12345,                            # int (Telethon msg.id)
-    'chat_username':    'samstudy1004',                   # str (config에서)
+    'chat_username':    'sunstudy1004',                   # str (config에서)
     'sent_at':          msg.date,                         # datetime (UTC, Telethon이 timezone-aware 반환)
     # downloaded_at 은 DB의 default now() 가 채움 — 보내지 않음
     'file_name':        '삼성전자_2026Q1.pdf',             # str (Telegram 원본명)
@@ -547,7 +547,7 @@ python-dotenv>=1.0
 |---|---|---|
 | `TELEGRAM_API_ID` | `12345` | my.telegram.org에서 발급 |
 | `TELEGRAM_API_HASH` | `abc...` (32자) | my.telegram.org에서 발급 |
-| `TELEGRAM_CHANNEL` | `samstudy1004` | 대상 채널 username (@ 없이) |
+| `TELEGRAM_CHANNEL` | `sunstudy1004` | 대상 채널 username (@ 없이) |
 | `SUPABASE_URL` | `https://iaphhvzddllabzgmhthj.supabase.co` | Supabase 프로젝트 URL |
 | `SUPABASE_SERVICE_KEY` | `eyJ...` | Supabase Settings → API → service_role key |
 
@@ -569,7 +569,7 @@ TELEGRAM_API_ID=
 TELEGRAM_API_HASH=
 
 # 대상 채널 (username만, @는 제외)
-TELEGRAM_CHANNEL=samstudy1004
+TELEGRAM_CHANNEL=sunstudy1004
 
 # === Supabase ===
 SUPABASE_URL=https://YOUR_PROJECT_ID.supabase.co

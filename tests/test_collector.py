@@ -13,7 +13,7 @@ from tests.conftest import FakeStorage, FakeTelegramClient, make_msg
 def cfg():
     """Minimal config-shaped object."""
     from types import SimpleNamespace
-    return SimpleNamespace(telegram_channel='samstudy1004', initial_cutoff_days=30)
+    return SimpleNamespace(telegram_channel='sunstudy1004', initial_cutoff_days=30)
 
 
 # === First-run behavior ===
@@ -23,7 +23,7 @@ async def test_first_run_uses_iter_since_date(fake_client, fake_storage, cfg):
     fake_client.new_messages = [make_msg(101)]
     # max_seen=0 → first run path
     result = await run(fake_client, fake_storage, cfg)
-    assert ('iter_since_date', 'samstudy1004', 30) in fake_client.calls
+    assert ('iter_since_date', 'sunstudy1004', 30) in fake_client.calls
 
 
 @pytest.mark.asyncio
@@ -31,7 +31,7 @@ async def test_subsequent_run_uses_iter_after_id(fake_client, fake_storage, cfg)
     fake_storage._max_seen = 100
     fake_client.new_messages = [make_msg(101)]
     await run(fake_client, fake_storage, cfg)
-    assert ('iter_after_id', 'samstudy1004', 100) in fake_client.calls
+    assert ('iter_after_id', 'sunstudy1004', 100) in fake_client.calls
 
 
 # === Stage B: new-message processing ===
@@ -51,7 +51,7 @@ async def test_new_pdf_message_is_downloaded_and_inserted(fake_client, fake_stor
     assert len(fake_storage.inserted) == 1
     inserted = fake_storage.inserted[0]
     assert inserted['message_id'] == 101
-    assert inserted['chat_username'] == 'samstudy1004'
+    assert inserted['chat_username'] == 'sunstudy1004'
     assert inserted['file_name'] == 'samsung_q1.pdf'
     assert inserted['file_path'] == '101_samsung_q1.pdf'
     assert inserted['caption'] == '삼성전자 Q1 실적'
@@ -81,7 +81,7 @@ async def test_download_failure_records_failed_attempt(fake_client, fake_storage
     assert fake_storage.inserted == []
     assert len(fake_storage.failed_upserts) == 1
     chat, mid, err = fake_storage.failed_upserts[0]
-    assert chat == 'samstudy1004'
+    assert chat == 'sunstudy1004'
     assert mid == 101
     assert 'network glitch' in err
 
@@ -118,11 +118,11 @@ async def test_failed_message_retried_at_start(fake_client, fake_storage, cfg):
 
     assert result.retried_success == 1
     # Retry lookup happened
-    assert ('get_by_id', 'samstudy1004', 100) in fake_client.calls
+    assert ('get_by_id', 'sunstudy1004', 100) in fake_client.calls
     # Insert happened for the retry
     assert any(m['message_id'] == 100 for m in fake_storage.inserted)
     # Failed_attempts row was removed
-    assert ('samstudy1004', 100) in fake_storage.failed_removes
+    assert ('sunstudy1004', 100) in fake_storage.failed_removes
 
 
 @pytest.mark.asyncio
@@ -143,7 +143,7 @@ async def test_failed_message_still_failing_increments_attempt(
     # Failed_attempts upsert (attempt_count++)
     assert any(mid == 100 for _, mid, _ in fake_storage.failed_upserts)
     # Was NOT removed
-    assert ('samstudy1004', 100) not in fake_storage.failed_removes
+    assert ('sunstudy1004', 100) not in fake_storage.failed_removes
 
 
 @pytest.mark.asyncio
@@ -158,7 +158,7 @@ async def test_deleted_message_is_cleaned_from_failed_attempts(
 
     result = await run(fake_client, fake_storage, cfg)
 
-    assert ('samstudy1004', 100) in fake_storage.failed_removes
+    assert ('sunstudy1004', 100) in fake_storage.failed_removes
     assert result.retried_fail == 0
     assert result.retried_success == 0
 
@@ -175,7 +175,7 @@ async def test_failed_lookup_returning_non_pdf_is_cleaned(
 
     result = await run(fake_client, fake_storage, cfg)
 
-    assert ('samstudy1004', 100) in fake_storage.failed_removes
+    assert ('sunstudy1004', 100) in fake_storage.failed_removes
 
 
 # === RunResult shape ===

@@ -28,7 +28,7 @@ See [design spec](docs/superpowers/specs/2026-05-05-telegram-report-collector-de
 
    Then edit `.env`:
    - `TELEGRAM_API_ID`, `TELEGRAM_API_HASH`: from https://my.telegram.org
-   - `TELEGRAM_CHANNEL`: channel username (default `samstudy1004`)
+   - `TELEGRAM_CHANNEL`: channel username (default `sunstudy1004`)
    - `SUPABASE_URL`, `SUPABASE_SERVICE_KEY`: from Supabase dashboard → Settings → API → `service_role` key (⚠️ secret — never commit)
 
 5. **First run** (will prompt for SMS verification once):

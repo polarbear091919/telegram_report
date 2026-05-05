@@ -8,7 +8,7 @@ from config import Config, load_config
 def test_load_config_happy_path(monkeypatch):
     monkeypatch.setenv('TELEGRAM_API_ID', '12345')
     monkeypatch.setenv('TELEGRAM_API_HASH', 'abcdef0123456789')
-    monkeypatch.setenv('TELEGRAM_CHANNEL', 'samstudy1004')
+    monkeypatch.setenv('TELEGRAM_CHANNEL', 'sunstudy1004')
     monkeypatch.setenv('SUPABASE_URL', 'https://test.supabase.co')
     monkeypatch.setenv('SUPABASE_SERVICE_KEY', 'eyJtest')
     # Don't set optional vars — they should pick up defaults
@@ -18,7 +18,7 @@ def test_load_config_happy_path(monkeypatch):
     assert isinstance(cfg, Config)
     assert cfg.telegram_api_id == 12345
     assert cfg.telegram_api_hash == 'abcdef0123456789'
-    assert cfg.telegram_channel == 'samstudy1004'
+    assert cfg.telegram_channel == 'sunstudy1004'
     assert cfg.supabase_url == 'https://test.supabase.co'
     assert cfg.supabase_service_key == 'eyJtest'
     # Defaults
@@ -29,6 +29,10 @@ def test_load_config_happy_path(monkeypatch):
 
 
 def test_load_config_missing_required_var_exits(monkeypatch):
+    # Suppress load_dotenv() so a real .env in the project root doesn't
+    # repopulate the env vars we just deleted.
+    monkeypatch.setattr('config.load_dotenv', lambda *a, **k: False)
+
     # Only set some of the required vars
     monkeypatch.setenv('TELEGRAM_API_ID', '12345')
     monkeypatch.delenv('TELEGRAM_API_HASH', raising=False)

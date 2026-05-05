@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** MVP CLI tool that, on each user-triggered run, collects PDF reports from a single Telegram channel (`samstudy1004`) into a local `./reports/` folder and writes metadata to a Supabase Postgres table. Failed downloads are tracked in a separate `failed_attempts` table and auto-retried on subsequent runs.
+**Goal:** MVP CLI tool that, on each user-triggered run, collects PDF reports from a single Telegram channel (`sunstudy1004`) into a local `./reports/` folder and writes metadata to a Supabase Postgres table. Failed downloads are tracked in a separate `failed_attempts` table and auto-retried on subsequent runs.
 
 **Architecture:** Modular Python script with five files (`main`, `config`, `telegram_client`, `storage`, `collector`). Each run executes two phases: (A) retry every message currently in `failed_attempts`, (B) fetch new messages via `min_id = MAX(reports ∪ failed_attempts)` and process each one. PDFs are saved with atomic `.partial → rename`. State of "what we've seen" is derived purely from the two DB tables — no separate state file.
 
@@ -88,7 +88,7 @@ TELEGRAM_API_ID=
 TELEGRAM_API_HASH=
 
 # 대상 채널 (username만, @ 제외)
-TELEGRAM_CHANNEL=samstudy1004
+TELEGRAM_CHANNEL=sunstudy1004
 
 # === Supabase ===
 SUPABASE_URL=https://YOUR_PROJECT_ID.supabase.co
@@ -257,7 +257,7 @@ from config import Config, load_config
 def test_load_config_happy_path(monkeypatch):
     monkeypatch.setenv('TELEGRAM_API_ID', '12345')
     monkeypatch.setenv('TELEGRAM_API_HASH', 'abcdef0123456789')
-    monkeypatch.setenv('TELEGRAM_CHANNEL', 'samstudy1004')
+    monkeypatch.setenv('TELEGRAM_CHANNEL', 'sunstudy1004')
     monkeypatch.setenv('SUPABASE_URL', 'https://test.supabase.co')
     monkeypatch.setenv('SUPABASE_SERVICE_KEY', 'eyJtest')
     # Don't set optional vars — they should pick up defaults
@@ -267,7 +267,7 @@ def test_load_config_happy_path(monkeypatch):
     assert isinstance(cfg, Config)
     assert cfg.telegram_api_id == 12345
     assert cfg.telegram_api_hash == 'abcdef0123456789'
-    assert cfg.telegram_channel == 'samstudy1004'
+    assert cfg.telegram_channel == 'sunstudy1004'
     assert cfg.supabase_url == 'https://test.supabase.co'
     assert cfg.supabase_service_key == 'eyJtest'
     # Defaults
@@ -1242,7 +1242,7 @@ from tests.conftest import FakeStorage, FakeTelegramClient, make_msg
 def cfg():
     """Minimal config-shaped object."""
     from types import SimpleNamespace
-    return SimpleNamespace(telegram_channel='samstudy1004', initial_cutoff_days=30)
+    return SimpleNamespace(telegram_channel='sunstudy1004', initial_cutoff_days=30)
 
 
 # === First-run behavior ===
@@ -1252,7 +1252,7 @@ async def test_first_run_uses_iter_since_date(fake_client, fake_storage, cfg):
     fake_client.new_messages = [make_msg(101)]
     # max_seen=0 → first run path
     result = await run(fake_client, fake_storage, cfg)
-    assert ('iter_since_date', 'samstudy1004', 30) in fake_client.calls
+    assert ('iter_since_date', 'sunstudy1004', 30) in fake_client.calls
 
 
 @pytest.mark.asyncio
@@ -1260,7 +1260,7 @@ async def test_subsequent_run_uses_iter_after_id(fake_client, fake_storage, cfg)
     fake_storage._max_seen = 100
     fake_client.new_messages = [make_msg(101)]
     await run(fake_client, fake_storage, cfg)
-    assert ('iter_after_id', 'samstudy1004', 100) in fake_client.calls
+    assert ('iter_after_id', 'sunstudy1004', 100) in fake_client.calls
 
 
 # === Stage B: new-message processing ===
@@ -1280,7 +1280,7 @@ async def test_new_pdf_message_is_downloaded_and_inserted(fake_client, fake_stor
     assert len(fake_storage.inserted) == 1
     inserted = fake_storage.inserted[0]
     assert inserted['message_id'] == 101
-    assert inserted['chat_username'] == 'samstudy1004'
+    assert inserted['chat_username'] == 'sunstudy1004'
     assert inserted['file_name'] == 'samsung_q1.pdf'
     assert inserted['file_path'] == '101_samsung_q1.pdf'
     assert inserted['caption'] == '삼성전자 Q1 실적'
@@ -1310,7 +1310,7 @@ async def test_download_failure_records_failed_attempt(fake_client, fake_storage
     assert fake_storage.inserted == []
     assert len(fake_storage.failed_upserts) == 1
     chat, mid, err = fake_storage.failed_upserts[0]
-    assert chat == 'samstudy1004'
+    assert chat == 'sunstudy1004'
     assert mid == 101
     assert 'network glitch' in err
 
@@ -1347,11 +1347,11 @@ async def test_failed_message_retried_at_start(fake_client, fake_storage, cfg):
 
     assert result.retried_success == 1
     # Retry lookup happened
-    assert ('get_by_id', 'samstudy1004', 100) in fake_client.calls
+    assert ('get_by_id', 'sunstudy1004', 100) in fake_client.calls
     # Insert happened for the retry
     assert any(m['message_id'] == 100 for m in fake_storage.inserted)
     # Failed_attempts row was removed
-    assert ('samstudy1004', 100) in fake_storage.failed_removes
+    assert ('sunstudy1004', 100) in fake_storage.failed_removes
 
 
 @pytest.mark.asyncio
@@ -1372,7 +1372,7 @@ async def test_failed_message_still_failing_increments_attempt(
     # Failed_attempts upsert (attempt_count++)
     assert any(mid == 100 for _, mid, _ in fake_storage.failed_upserts)
     # Was NOT removed
-    assert ('samstudy1004', 100) not in fake_storage.failed_removes
+    assert ('sunstudy1004', 100) not in fake_storage.failed_removes
 
 
 @pytest.mark.asyncio
@@ -1387,7 +1387,7 @@ async def test_deleted_message_is_cleaned_from_failed_attempts(
 
     result = await run(fake_client, fake_storage, cfg)
 
-    assert ('samstudy1004', 100) in fake_storage.failed_removes
+    assert ('sunstudy1004', 100) in fake_storage.failed_removes
     assert result.retried_fail == 0
     assert result.retried_success == 0
 
@@ -1404,7 +1404,7 @@ async def test_failed_lookup_returning_non_pdf_is_cleaned(
 
     result = await run(fake_client, fake_storage, cfg)
 
-    assert ('samstudy1004', 100) in fake_storage.failed_removes
+    assert ('sunstudy1004', 100) in fake_storage.failed_removes
 
 
 # === RunResult shape ===
@@ -1885,7 +1885,7 @@ See [design spec](docs/superpowers/specs/2026-05-05-telegram-report-collector-de
 
    Then edit `.env`:
    - `TELEGRAM_API_ID`, `TELEGRAM_API_HASH`: from https://my.telegram.org
-   - `TELEGRAM_CHANNEL`: channel username (default `samstudy1004`)
+   - `TELEGRAM_CHANNEL`: channel username (default `sunstudy1004`)
    - `SUPABASE_URL`, `SUPABASE_SERVICE_KEY`: from Supabase dashboard → Settings → API → `service_role` key (⚠️ secret — never commit)
 
 5. **First run** (will prompt for SMS verification once):
