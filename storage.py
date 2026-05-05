@@ -9,8 +9,10 @@ The Storage class (Supabase + filesystem operations) is added in later tasks.
 from __future__ import annotations
 
 import hashlib
+import os
 import re
 from pathlib import Path
+from typing import Any
 
 # Windows-forbidden filename chars + ASCII control chars (\x00–\x1f)
 _FORBIDDEN_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
@@ -55,3 +57,33 @@ def compute_sha256(file_path: Path, chunk_size: int = 64 * 1024) -> str:
                 break
             h.update(chunk)
     return h.hexdigest()
+
+
+class Storage:
+    """Storage facade over Supabase (metadata) + local filesystem (PDF blobs).
+
+    The supabase_client is `Any` to keep this module decoupled from supabase-py
+    types; pass a real `supabase.Client` in production, or `None` in
+    filesystem-only tests.
+    """
+
+    def __init__(self, supabase_client: Any, base_dir: Path) -> None:
+        self._sb = supabase_client
+        self.base_dir = Path(base_dir)
+
+    # === Filesystem ===
+
+    def save_pdf_atomically(self, content: bytes, filename: str) -> Path:
+        """Write `content` to `base_dir/filename` atomically.
+
+        Strategy: write to `<filename>.partial`, then `os.replace()` to
+        the final name (atomic on the same filesystem).
+
+        Returns the final Path on success. Raises on filesystem errors.
+        """
+        self.base_dir.mkdir(parents=True, exist_ok=True)
+        target = self.base_dir / filename
+        partial = target.with_suffix(target.suffix + '.partial')
+        partial.write_bytes(content)
+        os.replace(partial, target)
+        return target
