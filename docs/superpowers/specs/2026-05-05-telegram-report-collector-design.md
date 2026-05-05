@@ -16,7 +16,7 @@
 | `main.py` | CLI 진입점, 로깅 설정, 최상위 에러 표시 | (없음 — 다른 모듈만 호출) |
 | `config.py` | `.env` 로딩, 환경변수 → 타입 안전한 `Config` 객체로 변환 | `python-dotenv` |
 | `telegram_client.py` | Telethon 연결, 메시지 조회, 미디어 다운로드 | Telegram API |
-| `storage.py` | Supabase INSERT/SELECT, 로컬 파일 쓰기 | Supabase, 로컬 FS |
+| `storage.py` | Supabase INSERT/SELECT/UPSERT (reports + failed_attempts), 로컬 파일 쓰기 | Supabase, 로컬 FS |
 | `collector.py` | 오케스트레이션 (어떤 메시지를 받아서 어디에 넣을지 결정) | (telegram_client + storage 호출만) |
 
 ### 1.2 모듈 경계 원칙
@@ -40,40 +40,46 @@
 │  collector.py   │
 └────────┬────────┘
          │
-         │ 1) storage.get_last_processed_message_id(channel)
-         │    → returns int | None
+         │ === 단계 A: 과거 실패 메시지 재시도 ===
+         │ 1) storage.get_failed_message_ids(channel)
+         │    → list[int]
          │
-         │ 2) telegram_client.iter_new_messages(channel, after_id, cutoff_days)
-         │    → async generator of Message objects
-         │      ├─ last_id is None  → offset_date = now - cutoff_days (첫 실행)
-         │      └─ last_id existing → min_id = last_id - OVERLAP_BUFFER (재시도 위함)
+         │ for each failed_msg_id:
+         │   2) client.get_messages(channel, ids=failed_msg_id)
+         │   3a) 메시지 없음/PDF아님 → storage.remove_failed_attempt() (정리)
+         │   3b) 다운로드 시도:
+         │       - 성공 → reports INSERT + failed_attempts DELETE
+         │       - 실패 → failed_attempts UPSERT (attempt_count++)
+         │
+         │ === 단계 B: 신규 메시지 수집 ===
+         │ 4) storage.get_max_seen_message_id(channel)
+         │    → max(MAX(reports.message_id), MAX(failed_attempts.message_id), 0)
+         │      ├─ 0 (첫 실행)        → offset_date = now - cutoff_days
+         │      └─ 정수 (통상 실행)    → min_id = 그 값
          │
          │ for each message with PDF attachment:
-         │
-         │   3) storage.is_already_downloaded(channel, message_id)
-         │      → 멱등성 체크 (OVERLAP 범위의 이미 받은 건 여기서 skip)
-         │
-         │   4) telegram_client.download_pdf(message, target_path)
+         │   5) telegram_client.download_pdf(message, target_path)
          │      → 로컬 디스크에 PDF 저장 (atomic via .partial → rename)
-         │
-         │   5) storage.insert_report_metadata(meta_dict)
-         │      → Supabase에 row INSERT
+         │   6a) 성공 → storage.insert_report_metadata()
+         │   6b) 실패 → storage.upsert_failed_attempt()
          │
          │ done
          ▼
-   exit 0 (성공) / 1 (실패, 메시지 출력)
+   exit 0 (완전 성공) / 1 (전체 실패) / 2 (부분 실패: failed_attempts 증가)
 ```
 
 ### 1.4 핵심 설계 결정
 
-1. **단일 진실원**: "다음 실행 때 어디서부터 받을지"는 **Supabase의 `reports` 테이블의 `MAX(message_id)`** 로 도출. 별도 state 파일/테이블 없음. 이유:
+1. **단일 진실원**: "다음 실행 때 어디서부터 받을지"는 **`reports`와 `failed_attempts` 두 테이블의 `MAX(message_id)`** 로 도출. 별도 state 파일/테이블 없음. 이유:
    - 동기화 문제 없음 (Supabase가 그라운드 트루스)
    - 다운로드는 됐는데 INSERT 실패 시 → 다음 실행에서 재시도됨 (덮어쓰기, 멱등성 보장)
    - INSERT는 됐는데 다운로드 실패 시 → 발생하지 않음. 순서가 "다운로드 → INSERT" 이므로.
 
-2. **멱등성**: `(chat_username, message_id)` 컬럼에 UNIQUE 제약. 두 번 실행해도 중복 row 안 생김.
+2. **누락 없는 수집 보장**: 다운로드 실패한 메시지는 **`failed_attempts` 테이블에 영속 기록**되고, 매 실행마다 단계 A에서 자동 재시도됨. 일시적 실패가 영구히 stranded 되지 않음.
 
-3. **수집 단위**: 메시지 단위. Media group(앨범)의 각 PDF는 별개 메시지로 처리. UNIQUE 제약으로 중복 방지.
+3. **멱등성**: `(chat_username, message_id)` 컬럼에 UNIQUE 제약 (reports와 failed_attempts 모두). 두 번 실행해도 중복 row 안 생김.
+
+4. **수집 단위**: 메시지 단위. Media group(앨범)의 각 PDF는 별개 메시지로 처리. UNIQUE 제약으로 중복 방지.
 
 ---
 
@@ -82,6 +88,7 @@
 ### 2.1 테이블 정의 (`migrations/001_init.sql`)
 
 ```sql
+-- 성공적으로 다운로드된 리포트
 create table reports (
   -- 식별자
   id                bigserial primary key,
@@ -94,7 +101,7 @@ create table reports (
 
   -- 파일 정보
   file_name         text        not null,         -- Telegram 원본 파일명 (사람이 읽기용)
-  file_path         text        not null,         -- STORAGE_BASE_DIR 기준 상대경로
+  file_path         text        not null,         -- STORAGE_BASE_DIR 기준 상대경로 (MVP에선 파일명만)
   file_size_bytes   bigint      not null,
   file_hash_sha256  text        not null,         -- 무결성/재게시 탐지용
 
@@ -109,10 +116,32 @@ create table reports (
   unique (chat_username, message_id)
 );
 
+-- 다운로드 실패한 메시지 추적 (다음 실행에서 재시도 대상)
+-- 재시도 성공 시 row 삭제, 영구 실패면 attempt_count 증가
+create table failed_attempts (
+  id              bigserial primary key,
+  message_id      bigint      not null,
+  chat_username   text        not null,
+
+  first_failed_at timestamptz not null default now(),
+  last_failed_at  timestamptz not null default now(),
+  attempt_count   int         not null default 1,
+  error_message   text,                              -- 마지막 에러 메시지
+
+  unique (chat_username, message_id)
+);
+
 -- 자주 쓸 쿼리용 인덱스
 create index idx_reports_chat_msg on reports (chat_username, message_id desc);
 create index idx_reports_sent_at  on reports (sent_at desc);
 create index idx_reports_untagged on reports (tagged_at) where tagged_at is null;
+create index idx_failed_chat on failed_attempts (chat_username, message_id);
+
+-- Row-Level Security 활성화 (정책 없음 = anon/authenticated 모든 접근 거부)
+-- service_role 키는 RLS를 우회하므로 백엔드 스크립트 동작에 영향 없음
+-- 향후 프론트엔드 도입 시 select/insert 정책을 명시적으로 추가
+alter table reports enable row level security;
+alter table failed_attempts enable row level security;
 ```
 
 ### 2.2 컬럼별 의도
@@ -129,8 +158,8 @@ create index idx_reports_untagged on reports (tagged_at) where tagged_at is null
 
 - ❌ `analysis JSONB` — 분석 결과 컬럼. 태깅 단계 시작할 때 추가.
 - ❌ `category` 컬럼 — 분류 스키마 미정. `tags TEXT[]`로 통합.
-- ❌ Row-Level Security 정책 — service_role key로 백엔드에서만 접근. 프론트엔드 붙일 때 정의.
-- ❌ 별도 `state`/`config` 테이블 — `MAX(message_id)`로 도출.
+- ❌ RLS **정책** — RLS 자체는 활성화하지만 정책은 빈 상태로 둠 (anon/authenticated 모두 거부 = 안전 기본값). 프론트엔드 붙일 때 SELECT/INSERT 정책 추가.
+- ❌ 별도 `state`/`config` 테이블 — `MAX(message_id)`로 도출 (failed_attempts UNION reports).
 
 ### 2.4 마이그레이션 적용 방식
 
@@ -151,32 +180,57 @@ create index idx_reports_untagged on reports (tagged_at) where tagged_at is null
 
 → MVP는 v1으로 시작. 향후 v2가 stable로 전환되면 `telegram_client.py` 한 모듈만 수정하여 마이그레이션.
 
-### 3.2 통상 실행 (2번째 이후, `last_id IS NOT NULL`)
+### 3.2 통상 실행 (2번째 이후)
+
+각 실행은 **두 단계**로 진행:
+
+**단계 A — 과거 실패 메시지 재시도** (failed_attempts 테이블 기반):
 
 ```python
-last_id = storage.get_last_processed_message_id('samstudy1004')
+failed_ids = storage.get_failed_message_ids(channel)
+log.info("Retrying %d previously failed messages", len(failed_ids))
 
-OVERLAP_BUFFER = 50  # 과거 실패 메시지 자동 재시도용 버퍼
-
-async for msg in client.iter_messages(
-    'samstudy1004',
-    min_id=max(0, last_id - OVERLAP_BUFFER),
-    reverse=True,
-):
-    if not has_pdf(msg):
+for msg_id in failed_ids:
+    msg = await client.get_messages(channel, ids=msg_id)
+    if msg is None:
+        # Telegram에서 삭제된 메시지 → 더 이상 재시도 불필요
+        storage.remove_failed_attempt(channel, msg_id)
         continue
-    if storage.is_already_downloaded('samstudy1004', msg.id):
-        continue  # 이미 받은 건 skip (대부분 OVERLAP 범위 내 메시지가 여기 해당)
-    await process(msg)
+    if not has_pdf(msg):
+        # PDF가 아닌 메시지가 잘못 들어간 경우 → 제거
+        storage.remove_failed_attempt(channel, msg_id)
+        continue
+    try:
+        await process_one_message(msg)
+        storage.remove_failed_attempt(channel, msg_id)  # 성공 → 실패 기록 제거
+    except Exception as e:
+        storage.upsert_failed_attempt(channel, msg_id, str(e))  # 여전히 실패 → attempt_count++
 ```
 
-- `min_id=N` → ID > N 인 메시지만 (Telegram 서버 측 필터, 효율적)
-- `reverse=True` → 오래된 → 최신 순 (도중에 끊겨도 자연스럽게 이어감)
-- `OVERLAP_BUFFER=50` → 과거 50개 메시지를 재스캔. `is_already_downloaded` 가 대부분 즉시 skip시키지만, **과거 다운로드 실패한 메시지가 있다면 여기서 자동 재시도됨**. 추가 비용은 ~50회 DB SELECT (인덱스 사용으로 ms 단위).
+**단계 B — 신규 메시지 수집**:
 
-이 OVERLAP 메커니즘이 "사용자 요구사항: **아직 다운로드 하지 않은** 리포트를 모두 수집" 을 보장.
+```python
+last_seen_id = storage.get_max_seen_message_id(channel)
+# = SELECT GREATEST(
+#     COALESCE((SELECT MAX(message_id) FROM reports WHERE chat_username=?), 0),
+#     COALESCE((SELECT MAX(message_id) FROM failed_attempts WHERE chat_username=?), 0)
+#   )
 
-**알려진 한계**: OVERLAP_BUFFER(=50) 보다 더 오래된 실패 메시지는 자동 재시도 안 됨. 발생 시 로그에 `Failed=N` 으로 보임 → 사용자가 인지 후 수동 조치(실패 row의 `INITIAL_CUTOFF_DAYS` 임시 늘려 재실행 등). MVP 후속으로 `--retry-failed` 플래그나 watermark 테이블 도입 검토.
+async for msg in client.iter_messages(channel, min_id=last_seen_id, reverse=True):
+    if not has_pdf(msg):
+        continue
+    try:
+        await process_one_message(msg)
+    except Exception as e:
+        storage.upsert_failed_attempt(channel, msg.id, str(e))
+```
+
+**핵심 포인트**:
+- `min_id`는 **reports + failed_attempts 둘 다** 의 최대값. 이미 시도한 메시지는 단계 A에서만 재시도되므로 단계 B에서 중복 처리 안 됨.
+- 단계 A에서 영구적으로 못 내려받는 메시지(예: 채널에서 삭제됨, 형식 문제)는 자동 정리됨.
+- `attempt_count` 가 임계값(예: 10) 넘으면 운영자가 알 수 있도록 로그에 강조 출력. 자동 차단은 안 함 (MVP).
+
+이 방식이 "사용자 요구사항: **아직 다운로드 하지 않은** 리포트를 모두 수집"을 영속적으로 보장.
 
 ### 3.3 첫 실행 (`last_id IS NULL` 인 경우)
 
@@ -290,13 +344,16 @@ def sanitize_filename(name: str, max_len: int = 100) -> str:
 
 ### 4.4 다운로드 절차 (atomic)
 
+(아래 디스크 경로는 `STORAGE_BASE_DIR=./reports` 기본값 기준의 실제 파일 시스템 경로. DB의 `file_path` 컬럼에는 STORAGE_BASE_DIR 기준 상대경로 = 파일명만 저장됨 — 섹션 4.7 참조.)
+
 ```
-1) target = reports/12345_filename.pdf
-2) temp   = reports/12345_filename.pdf.partial
+filename = 12345_삼성전자.pdf            # DB의 file_path 컬럼에 들어감
+1) target = STORAGE_BASE_DIR/filename     # 실제 디스크 경로 (예: ./reports/12345_삼성전자.pdf)
+2) temp   = target + '.partial'           # 예: ./reports/12345_삼성전자.pdf.partial
 3) Telethon download → temp 에 씀
 4) 다운로드 완료 후 sha256 계산
 5) os.replace(temp, target)   # atomic rename
-6) Supabase INSERT (file_path, file_hash 등)
+6) Supabase INSERT (file_path=filename, file_hash 등)
 7) 실패 시: temp 파일 그대로 두고 raise (다음 실행에서 재시도)
 ```
 
@@ -317,26 +374,29 @@ def sanitize_filename(name: str, max_len: int = 100) -> str:
 
 ```python
 {
-    'message_id':       12345,                              # int (Telethon msg.id)
-    'chat_username':    'samstudy1004',                     # str (config에서)
-    'sent_at':          msg.date,                           # datetime (UTC, Telethon이 timezone-aware 반환)
+    'message_id':       12345,                            # int (Telethon msg.id)
+    'chat_username':    'samstudy1004',                   # str (config에서)
+    'sent_at':          msg.date,                         # datetime (UTC, Telethon이 timezone-aware 반환)
     # downloaded_at 은 DB의 default now() 가 채움 — 보내지 않음
-    'file_name':        '삼성전자_2026Q1.pdf',               # str (Telegram 원본명)
-    'file_path':        'reports/12345_삼성전자_2026Q1.pdf', # str (STORAGE_BASE_DIR 기준 상대경로)
-    'file_size_bytes':  1_234_567,                          # int
-    'file_hash_sha256': 'abc123...',                        # str (소문자 hex)
-    'caption':          msg.message,                         # str | None (msg.message은 캡션 텍스트)
+    'file_name':        '삼성전자_2026Q1.pdf',             # str (Telegram 원본명)
+    'file_path':        '12345_삼성전자_2026Q1.pdf',       # str (STORAGE_BASE_DIR 기준 상대경로 = MVP에선 파일명만)
+    'file_size_bytes':  1_234_567,                        # int
+    'file_hash_sha256': 'abc123...',                      # str (소문자 hex)
+    'caption':          msg.message,                       # str | None (msg.message은 캡션 텍스트)
     # tags, tagged_at 은 NULL 로 시작 — 보내지 않음
 }
 ```
 
 ### 4.7 `file_path` 컬럼 저장 형식
 
-`STORAGE_BASE_DIR` 기준 상대경로 저장. 예: `reports/12345_삼성전자.pdf`.
+**`STORAGE_BASE_DIR` 기준 상대경로**. MVP에서는 디렉토리 계층이 없으므로 **파일명만 저장**. 예: `12345_삼성전자.pdf`.
 
-이유:
-- 사용자가 프로젝트 폴더를 옮겨도 DB row는 유효
-- 향후 PDF를 클라우드로 옮길 때 `STORAGE_BASE_DIR`만 바꾸면 마이그레이션 가능
+조회 시 실제 경로 = `os.path.join(config.storage_base_dir, row['file_path'])`.
+
+이 정의의 이점:
+- **이전 친화적**: 사용자가 프로젝트 폴더를 옮겨도 DB row는 그대로 유효
+- **클라우드 마이그레이션 친화적**: `STORAGE_BASE_DIR`을 `s3://bucket/reports/`로 바꾸면 file_path는 그대로, base만 변경
+- **컬럼 시맨틱 명확**: "이름이 무엇인가"이지 "파일 시스템 어디에 있는가"가 아님
 
 ### 4.8 .gitignore 내용
 
@@ -387,22 +447,28 @@ venv/
 
 ### 5.3 메시지 단위 에러 격리 패턴
 
+세부 흐름은 섹션 3.2 참조. 핵심: 단일 메시지 실패는 **`failed_attempts` 테이블에 영속 기록**되어 다음 실행에서 자동 재시도. 한 메시지 실패가 batch를 중단시키지 않음.
+
 ```python
+# 단계 B (신규 메시지 수집) 의 에러 격리:
 processed = skipped = failed = 0
-async for msg in client.iter_messages(channel, min_id=last_id, reverse=True):
+async for msg in client.iter_messages(channel, min_id=last_seen_id, reverse=True):
     if not has_pdf(msg):
         skipped += 1
         continue
     try:
         await process_one_message(msg)
         processed += 1
-    except Exception:
+    except Exception as e:
         log.exception("Failed to process message_id=%s", msg.id)
+        storage.upsert_failed_attempt(channel, msg.id, str(e))
         failed += 1
-        # 계속 다음 메시지로
+        # 계속 다음 메시지로 (실패는 DB에 영속 기록됨)
 
 log.info("Run complete. Processed=%d Skipped=%d Failed=%d", processed, skipped, failed)
 ```
+
+**알려진 한계 (운영 가이드)**: `failed_attempts.attempt_count`가 임계값(예: 10) 이상으로 누적되면, 해당 메시지는 영구적으로 실패할 가능성이 큼 (예: PDF 파일 자체가 깨짐, Telegram 측 권한 변경 등). 로그에서 `WARNING: msg_id=12345 has failed 10 times` 표시 → 사용자가 수동으로 row 검토. MVP 후속으로 자동 dead-letter 분리 검토.
 
 ### 5.4 로깅
 
@@ -425,8 +491,21 @@ log.info("Run complete. Processed=%d Skipped=%d Failed=%d", processed, skipped, 
 
 ### 5.5 종료 코드
 
-- `0` — 성공 (처리 0건이어도 OK)
-- `1` — 모든 실패 (config / auth / network / unhandled)
+부분 실패를 모니터링/cron 통합에서 놓치지 않도록 3단계로 분리:
+
+| 코드 | 의미 | 트리거 조건 |
+|---|---|---|
+| `0` | **완전 성공** | 모든 메시지 처리 완료. failed=0, retried_fail=0. 처리 0건도 포함. |
+| `1` | **전체 실패** | 시작도 못 한 상태 — config 오류, auth 실패, Telegram/Supabase 연결 실패, unhandled exception 등 |
+| `2` | **부분 실패** | 일부 메시지는 성공했으나 일부가 `failed_attempts`에 추가됨/UPDATE됨. 사용자 인지 필요. |
+
+```python
+if not started_successfully:
+    sys.exit(1)
+if failed > 0 or retried_fail > 0:
+    sys.exit(2)
+sys.exit(0)
+```
 
 ### 5.6 명시적으로 빼는 항목 (YAGNI)
 
@@ -443,7 +522,9 @@ log.info("Run complete. Processed=%d Skipped=%d Failed=%d", processed, skipped, 
 
 ### 6.1 Python 버전
 
-**Python 3.10+** 권장. 최소 3.8 이상.
+**Python 3.10+ 필수**. 
+
+이유: `supabase-py` 2.x가 Python 3.9+를 요구하고, 우리는 타입 힌트와 pattern matching 사용을 위해 3.10을 기준으로 통일. 3.8/3.9 지원 분기를 두지 않음.
 
 ### 6.2 의존성 (`requirements.txt`)
 
@@ -630,11 +711,14 @@ python main.py
 | 아키텍처 | 모듈형 4-5 파일 분리 | 단일 파일 / 비동기 파이프라인 |
 | 메타데이터 저장소 | Supabase (Postgres) | SQLite 로컬 |
 | PDF 저장소 | 로컬 단일 폴더 | Supabase Storage / 카테고리별 분류 |
-| 상태 추적 | `MAX(message_id)` 도출 + OVERLAP_BUFFER=50 | 별도 state.json / state 테이블 / per-message 상태 |
+| 상태 추적 | `reports` + `failed_attempts` 두 테이블의 max(message_id) | 별도 state.json / OVERLAP_BUFFER 만으로 처리 / per-message status 컬럼 |
+| 부분 실패 처리 | `failed_attempts` 영속 추적, 매 실행 시 재시도 | 이번 실행만 로그 후 망각 / 단일 실패 시 abort |
+| 종료 코드 | 0/1/2 (성공/전체실패/부분실패) | 0/1 단순 이분법 |
+| RLS | 활성화 (정책 없음 = anon 거부) | 비활성화 후 프론트엔드 도입 시 활성화 |
 | Telethon 버전 | v1.x (`>=1.36,<2.0`) | v2 (alpha라 기각) |
 | 첫 실행 정책 | `INITIAL_CUTOFF_DAYS=30` | 전체 히스토리 / baseline만 |
 | 파일명 패턴 | `{message_id}_{sanitized_원본}` | 원본만 / 해시 / 날짜 prefix |
 | 재시도 전략 | 자연 재실행 (skill 미도입) | tenacity / DLQ / 백오프 |
 | CLI 프레임워크 | `argparse` (stdlib) | click / typer |
 | 설정 검증 | `dataclass` + 수동 | pydantic |
-| Python 버전 | 3.10+ | 3.8/3.9 |
+| Python 버전 | 3.10+ 필수 | 3.8/3.9 호환 분기 |
