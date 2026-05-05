@@ -3,6 +3,9 @@
 *.session
 *.session-journal
 sessions/
+.auth_*.txt
+check_supabase.py
+auth_helper.py
 
 # Downloaded data
 reports/
