@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -162,7 +163,7 @@ class Storage:
             new_count = int(row['attempt_count']) + 1
             self._sb.table('failed_attempts').update({
                 'attempt_count': new_count,
-                'last_failed_at': 'now()',
+                'last_failed_at': datetime.now(timezone.utc).isoformat(),
                 'error_message': error_message,
             }).eq('id', row['id']).execute()
             return new_count
