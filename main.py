@@ -1,0 +1,130 @@
+"""CLI entry point.
+
+Exit codes (spec §5.5):
+  0 = complete success (no failures, possibly nothing to do)
+  1 = total failure (config / auth / network / unhandled)
+  2 = partial failure (some messages went to failed_attempts this run)
+"""
+from __future__ import annotations
+
+import argparse
+import asyncio
+import dataclasses
+import logging
+import sys
+from typing import Sequence
+
+import collector
+from collector import RunResult
+from config import Config, load_config
+from storage import build_storage
+from telegram_client import TelegramClient
+
+log = logging.getLogger('main')
+
+
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        prog='telegram_report',
+        description='Collect PDF reports from a Telegram channel into Supabase + local FS.',
+    )
+    p.add_argument(
+        '--cutoff-days',
+        type=int,
+        default=None,
+        help='Override INITIAL_CUTOFF_DAYS for this run (only affects first run).',
+    )
+    p.add_argument(
+        '--dry-run',
+        action='store_true',
+        help='Show which messages would be downloaded without saving anything.',
+    )
+    p.add_argument(
+        '-v', '--verbose',
+        action='store_true',
+        help='Set log level to DEBUG.',
+    )
+    return p.parse_args(argv)
+
+
+def setup_logging(verbose: bool, level_str: str = 'INFO') -> None:
+    level = logging.DEBUG if verbose else getattr(logging, level_str.upper(), logging.INFO)
+    logging.basicConfig(
+        level=level,
+        format='%(asctime)s %(levelname)-8s %(name)-10s %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S',
+        stream=sys.stderr,
+    )
+
+
+def compute_exit_code(result: RunResult) -> int:
+    """Map a RunResult to an exit code per spec §5.5."""
+    if result.failed > 0 or result.retried_fail > 0:
+        return 2
+    return 0
+
+
+async def _amain(args: argparse.Namespace, config: Config) -> int:
+    async with TelegramClient(
+        api_id=config.telegram_api_id,
+        api_hash=config.telegram_api_hash,
+        session_path=config.telegram_session_path,
+    ) as client:
+        storage = build_storage(
+            supabase_url=config.supabase_url,
+            supabase_service_key=config.supabase_service_key,
+            base_dir=config.storage_base_dir,
+        )
+        if args.dry_run:
+            return await _dry_run(client, storage, config)
+        result = await collector.run(client, storage, config)
+        return compute_exit_code(result)
+
+
+async def _dry_run(client, storage, config: Config) -> int:
+    """List which messages would be processed, without writing anything."""
+    from telegram_client import has_pdf, _get_original_filename
+    channel = config.telegram_channel
+    last_seen = storage.get_max_seen_message_id(channel)
+    if last_seen == 0:
+        msgs = client.iter_messages_since_date(channel, config.initial_cutoff_days)
+    else:
+        msgs = client.iter_messages_after_id(channel, last_seen)
+    log.info("DRY RUN — would process the following:")
+    n = 0
+    async for msg in msgs:
+        if has_pdf(msg):
+            log.info("  msg_id=%s sent_at=%s file=%s",
+                     msg.id, msg.date.isoformat(), _get_original_filename(msg))
+            n += 1
+    log.info("DRY RUN — total %d PDF messages", n)
+    return 0
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = parse_args(argv)
+    try:
+        config = load_config()
+    except SystemExit as e:
+        # load_config already prints; re-raise as exit code 1
+        print(f"Config error: {e}", file=sys.stderr)
+        return 1
+
+    setup_logging(args.verbose, level_str=config.log_level)
+
+    # Apply CLI overrides on top of env config
+    if args.cutoff_days is not None:
+        config = dataclasses.replace(config, initial_cutoff_days=args.cutoff_days)
+
+    try:
+        return asyncio.run(_amain(args, config))
+    except KeyboardInterrupt:
+        log.warning("Interrupted by user")
+        return 1
+    except Exception:
+        log.exception("Fatal error")
+        return 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())
