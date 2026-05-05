@@ -87,3 +87,108 @@ class Storage:
         partial.write_bytes(content)
         os.replace(partial, target)
         return target
+
+    # === Supabase ===
+
+    def get_max_seen_message_id(self, chat_username: str) -> int:
+        """Return max(message_id) from reports ∪ failed_attempts for this chat.
+
+        Returns 0 if the channel has no rows yet (= first run).
+        """
+        # Two queries → max in Python. Cleaner than UNION via the supabase-py builder.
+        max_reports = self._max_in_table('reports', chat_username)
+        max_failed = self._max_in_table('failed_attempts', chat_username)
+        return max(max_reports, max_failed)
+
+    def _max_in_table(self, table: str, chat_username: str) -> int:
+        result = (
+            self._sb.table(table)
+            .select('message_id')
+            .eq('chat_username', chat_username)
+            .order('message_id', desc=True)
+            .limit(1)
+            .execute()
+        )
+        if not result.data:
+            return 0
+        return int(result.data[0]['message_id'])
+
+    def get_failed_message_ids(self, chat_username: str) -> list[int]:
+        """Return all message_ids currently in failed_attempts for this chat (oldest first)."""
+        result = (
+            self._sb.table('failed_attempts')
+            .select('message_id')
+            .eq('chat_username', chat_username)
+            .order('message_id', desc=False)
+            .execute()
+        )
+        return [int(row['message_id']) for row in (result.data or [])]
+
+    def insert_report_metadata(self, meta: dict) -> None:
+        """Insert a row into reports. Caller supplies all not-null fields except downloaded_at.
+
+        Required keys (see spec §4.6):
+          message_id, chat_username, sent_at, file_name, file_path,
+          file_size_bytes, file_hash_sha256
+        Optional: caption.
+        """
+        # sent_at must be ISO-format string for supabase-py over REST
+        payload = dict(meta)
+        sent_at = payload.get('sent_at')
+        if sent_at is not None and not isinstance(sent_at, str):
+            payload['sent_at'] = sent_at.isoformat()
+        self._sb.table('reports').insert(payload).execute()
+
+    def upsert_failed_attempt(
+        self, chat_username: str, message_id: int, error_message: str
+    ) -> int:
+        """Insert a new failed_attempts row, or increment attempt_count if it exists.
+
+        Returns the NEW attempt_count value (1 on first failure, prev+1 on retry).
+        Caller can use this for threshold-based warnings (spec §5.3).
+        """
+        # supabase-py `upsert` with on_conflict requires us to manage attempt_count
+        # manually, since we want += 1 on conflict. So: SELECT first, then INSERT or UPDATE.
+        existing = (
+            self._sb.table('failed_attempts')
+            .select('id, attempt_count')
+            .eq('chat_username', chat_username)
+            .eq('message_id', message_id)
+            .limit(1)
+            .execute()
+        )
+        if existing.data:
+            row = existing.data[0]
+            new_count = int(row['attempt_count']) + 1
+            self._sb.table('failed_attempts').update({
+                'attempt_count': new_count,
+                'last_failed_at': 'now()',
+                'error_message': error_message,
+            }).eq('id', row['id']).execute()
+            return new_count
+        else:
+            self._sb.table('failed_attempts').insert({
+                'message_id': message_id,
+                'chat_username': chat_username,
+                'attempt_count': 1,
+                'error_message': error_message,
+            }).execute()
+            return 1
+
+    def remove_failed_attempt(self, chat_username: str, message_id: int) -> None:
+        """Delete the failed_attempts row for this message (no-op if absent)."""
+        (
+            self._sb.table('failed_attempts')
+            .delete()
+            .eq('chat_username', chat_username)
+            .eq('message_id', message_id)
+            .execute()
+        )
+
+
+def build_storage(supabase_url: str, supabase_service_key: str, base_dir: Path) -> Storage:
+    """Construct a Storage with a real supabase client. Used by main.py."""
+    from supabase import create_client  # imported lazily to keep tests fast
+
+    client = create_client(supabase_url, supabase_service_key)
+    return Storage(supabase_client=client, base_dir=base_dir)
