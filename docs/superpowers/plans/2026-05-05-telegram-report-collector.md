@@ -907,7 +907,11 @@ Append to `storage.py` (inside the `Storage` class):
         return [int(row['message_id']) for row in (result.data or [])]
 
     def insert_report_metadata(self, meta: dict) -> None:
-        """Insert a row into reports. Caller supplies all not-null fields except downloaded_at.
+        """Upsert a row into reports keyed on (chat_username, message_id).
+
+        Idempotent at the DB layer: re-running with the same key updates the row
+        with identical data (harmless), avoiding stuck-retry loops when an INSERT
+        appears to fail but actually committed (transient timeouts).
 
         Required keys (see spec §4.6):
           message_id, chat_username, sent_at, file_name, file_path,
@@ -919,7 +923,10 @@ Append to `storage.py` (inside the `Storage` class):
         sent_at = payload.get('sent_at')
         if sent_at is not None and not isinstance(sent_at, str):
             payload['sent_at'] = sent_at.isoformat()
-        self._sb.table('reports').insert(payload).execute()
+        self._sb.table('reports').upsert(
+            payload,
+            on_conflict='chat_username,message_id',
+        ).execute()
 
     def upsert_failed_attempt(
         self, chat_username: str, message_id: int, error_message: str
@@ -944,7 +951,7 @@ Append to `storage.py` (inside the `Storage` class):
             new_count = int(row['attempt_count']) + 1
             self._sb.table('failed_attempts').update({
                 'attempt_count': new_count,
-                'last_failed_at': 'now()',
+                'last_failed_at': datetime.now(timezone.utc).isoformat(),
                 'error_message': error_message,
             }).eq('id', row['id']).execute()
             return new_count
