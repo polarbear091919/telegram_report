@@ -114,16 +114,57 @@ class Storage:
             return 0
         return int(result.data[0]['message_id'])
 
+    def get_all_message_ids(self, chat_username: str) -> set[int]:
+        """Return ALL message_ids already in reports for this chat.
+
+        Pages through results explicitly because PostgREST/Supabase enforces a
+        default max of 1000 rows per request — without pagination, this returns
+        an incomplete set once the table exceeds that, breaking backfill dedupe
+        (spec §3.1).
+        """
+        PAGE_SIZE = 1000
+        ids: set[int] = set()
+        offset = 0
+        while True:
+            result = (
+                self._sb.table('reports')
+                .select('message_id')
+                .eq('chat_username', chat_username)
+                .order('message_id')  # stable order for predictable paging
+                .range(offset, offset + PAGE_SIZE - 1)
+                .execute()
+            )
+            batch = result.data or []
+            ids.update(int(row['message_id']) for row in batch)
+            if len(batch) < PAGE_SIZE:
+                break
+            offset += PAGE_SIZE
+        return ids
+
     def get_failed_message_ids(self, chat_username: str) -> list[int]:
-        """Return all message_ids currently in failed_attempts for this chat (oldest first)."""
-        result = (
-            self._sb.table('failed_attempts')
-            .select('message_id')
-            .eq('chat_username', chat_username)
-            .order('message_id', desc=False)
-            .execute()
-        )
-        return [int(row['message_id']) for row in (result.data or [])]
+        """Return all message_ids currently in failed_attempts for this chat (oldest first).
+
+        Paginates to defeat Supabase's default 1000-row response limit
+        (spec §3.2). Same pattern as get_all_message_ids.
+        """
+        PAGE_SIZE = 1000
+        ids: list[int] = []
+        offset = 0
+        while True:
+            result = (
+                self._sb.table('failed_attempts')
+                .select('message_id')
+                .eq('chat_username', chat_username)
+                .order('message_id', desc=False)
+                .range(offset, offset + PAGE_SIZE - 1)
+                .execute()
+            )
+            batch = result.data or []
+            ids.extend(int(row['message_id']) for row in batch)
+            if len(batch) < PAGE_SIZE:
+                break
+            offset += PAGE_SIZE
+        return ids
 
     def insert_report_metadata(self, meta: dict) -> None:
         """Upsert a row into reports keyed on (chat_username, message_id).
