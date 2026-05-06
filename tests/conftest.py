@@ -88,10 +88,12 @@ class FakeStorage:
     """In-memory fake matching the Storage interface used by collector."""
 
     def __init__(self, base_dir: Path, max_seen: int = 0,
-                 failed_ids: list[int] | None = None) -> None:
+                 failed_ids: list[int] | None = None,
+                 existing_ids: set[int] | None = None) -> None:
         self.base_dir = base_dir
         self._max_seen = max_seen
         self._failed_ids = list(failed_ids or [])
+        self._existing_ids: set[int] = set(existing_ids or [])
         self.inserted: list[dict] = []
         self.failed_upserts: list[tuple[str, int, str]] = []
         self.failed_removes: list[tuple[str, int]] = []
@@ -102,6 +104,9 @@ class FakeStorage:
 
     def get_failed_message_ids(self, chat_username: str) -> list[int]:
         return list(self._failed_ids)
+
+    def get_all_message_ids(self, chat_username: str) -> set[int]:
+        return set(self._existing_ids)
 
     def insert_report_metadata(self, meta: dict) -> None:
         self.inserted.append(meta)

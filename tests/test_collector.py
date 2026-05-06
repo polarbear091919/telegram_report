@@ -235,3 +235,93 @@ async def test_concurrency_n1_is_serial(fake_storage):
     await run(client, fake_storage, cfg)
 
     assert client.max_concurrent_observed == 1
+
+
+# === Backfill mode ===
+
+@pytest.mark.asyncio
+async def test_backfill_mode_pre_fetches_existing_ids(fake_client, fake_storage, cfg):
+    """Backfill mode skips messages whose id is already in reports."""
+    fake_storage._existing_ids = {100, 101}
+    fake_client.new_messages = [make_msg(100), make_msg(101), make_msg(102)]
+
+    result = await run(fake_client, fake_storage, cfg, backfill_days=30)
+
+    assert result.processed == 1  # only 102 is new
+    assert result.skipped == 2     # 100, 101 are pre-known
+    inserted_ids = [m['message_id'] for m in fake_storage.inserted]
+    assert 102 in inserted_ids
+    assert 100 not in inserted_ids
+    assert 101 not in inserted_ids
+
+
+@pytest.mark.asyncio
+async def test_backfill_mode_includes_failed_attempts_in_skip_set(
+    fake_client, fake_storage, cfg
+):
+    """Messages still in failed_attempts after Stage A must be skipped in Stage B,
+    otherwise we double-process them in the same run."""
+    # Stage A: msg_id=200 is in failed_attempts, retry will fail again
+    fake_storage._failed_ids = [200]
+    fake_storage._max_seen = 200
+    fake_client.failed_lookups[200] = make_msg(200)
+    fake_client.download_errors[200] = RuntimeError('persistent fail')
+    # Stage B: cutoff_date iter returns the same msg_id 200 + a new 201
+    fake_client.new_messages = [make_msg(200), make_msg(201)]
+
+    result = await run(fake_client, fake_storage, cfg, backfill_days=30)
+
+    # Stage A should record one fail
+    assert result.retried_fail == 1
+    # Stage B should NOT re-process 200 (it's in failed_attempts post-Stage-A)
+    inserted_ids = [m['message_id'] for m in fake_storage.inserted]
+    assert 201 in inserted_ids
+    assert 200 not in inserted_ids
+    assert result.processed == 1  # only 201
+    # 200 should appear EXACTLY ONCE in download attempts (Stage A only)
+    download_calls = [c for c in fake_client.calls if c[0] == 'download' and c[1] == 200]
+    assert len(download_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_backfill_mode_uses_since_date_iter(fake_client, fake_storage, cfg):
+    """In backfill mode, iter_messages_since_date is called with backfill_days,
+    even when last_seen > 0."""
+    fake_storage._max_seen = 999  # nonzero — would normally trigger after_id mode
+    fake_client.new_messages = [make_msg(101)]
+
+    await run(fake_client, fake_storage, cfg, backfill_days=90)
+
+    assert ('iter_since_date', 'sunstudy1004', 90) in fake_client.calls
+    assert not any(c[0] == 'iter_after_id' for c in fake_client.calls)
+
+
+@pytest.mark.asyncio
+async def test_backfill_mode_runs_stage_a(fake_client, fake_storage, cfg):
+    """Backfill mode does NOT skip Stage A — failed retries still happen."""
+    fake_storage._failed_ids = [50]
+    fake_client.failed_lookups[50] = make_msg(50)
+    fake_client.new_messages = []
+
+    await run(fake_client, fake_storage, cfg, backfill_days=30)
+
+    assert ('get_by_id', 'sunstudy1004', 50) in fake_client.calls
+
+
+@pytest.mark.asyncio
+async def test_normal_mode_does_not_pre_fetch_existing_ids(
+    fake_client, fake_storage, cfg
+):
+    """Without backfill_days, get_all_message_ids should never be called."""
+    # Set existing_ids to non-empty; if the collector mistakenly calls
+    # get_all_message_ids in normal mode, msg 101 would be skipped.
+    fake_storage._existing_ids = {101}
+    fake_client.new_messages = [make_msg(101)]
+
+    result = await run(fake_client, fake_storage, cfg)  # no backfill_days
+
+    # Normal mode uses min_id/since_date, not the pre-fetched set,
+    # so 101 should be processed normally.
+    assert result.processed == 1
+    inserted_ids = [m['message_id'] for m in fake_storage.inserted]
+    assert 101 in inserted_ids

@@ -30,11 +30,19 @@ class RunResult:
     retried_fail: int = 0    # Stage A: still failing after retry
 
 
-async def run(client: Any, storage: Any, config: Any) -> RunResult:
+async def run(
+    client: Any,
+    storage: Any,
+    config: Any,
+    backfill_days: int | None = None,
+) -> RunResult:
     """Run one collection cycle for the configured channel.
 
     Stage A: re-attempt every msg_id currently in failed_attempts (parallelized).
-    Stage B: fetch messages with id > max_seen and process them (parallelized).
+    Stage B: fetch messages and process them (parallelized).
+      - Normal mode (backfill_days=None): start from MAX(reports + failed_attempts).
+      - Backfill mode (backfill_days=int): iterate from N days ago, skipping
+        message_ids already in reports OR still in failed_attempts after Stage A.
 
     Both stages share a single Semaphore so total concurrent downloads
     cannot exceed config.max_concurrent_downloads.
@@ -73,14 +81,28 @@ async def run(client: Any, storage: Any, config: Any) -> RunResult:
     retried_fail = sum(1 for r in stage_a_results if r == 'fail')
 
     # === Stage B: fetch new messages (parallel) ===
-    last_seen = storage.get_max_seen_message_id(channel)
-    log.info("Stage B: last_seen_message_id=%s", last_seen)
-
-    if last_seen == 0:
-        log.info("First run; using cutoff=%d days", config.initial_cutoff_days)
-        message_iter = client.iter_messages_since_date(channel, config.initial_cutoff_days)
+    if backfill_days is not None:
+        # Backfill mode: pre-fetch dedupe set AFTER Stage A so newly-added
+        # reports rows AND still-failing failed_attempts rows are both included.
+        # Skipping the latter avoids double-processing the same msg_id in one run
+        # (spec §3.3).
+        existing_ids = storage.get_all_message_ids(channel)
+        existing_ids.update(storage.get_failed_message_ids(channel))
+        log.info(
+            "Backfill mode: %d existing message_ids will be skipped "
+            "(reports + still-failed), fetching from %d days ago",
+            len(existing_ids), backfill_days,
+        )
+        message_iter = client.iter_messages_since_date(channel, backfill_days)
     else:
-        message_iter = client.iter_messages_after_id(channel, last_seen)
+        existing_ids = None
+        last_seen = storage.get_max_seen_message_id(channel)
+        log.info("Stage B: last_seen_message_id=%s", last_seen)
+        if last_seen == 0:
+            log.info("First run; using cutoff=%d days", config.initial_cutoff_days)
+            message_iter = client.iter_messages_since_date(channel, config.initial_cutoff_days)
+        else:
+            message_iter = client.iter_messages_after_id(channel, last_seen)
 
     async def process_new(msg) -> str:
         async with sem:
@@ -99,6 +121,9 @@ async def run(client: Any, storage: Any, config: Any) -> RunResult:
     skipped = 0
     async for msg in message_iter:
         if not has_pdf(msg):
+            skipped += 1
+            continue
+        if existing_ids is not None and msg.id in existing_ids:
             skipped += 1
             continue
         tasks.append(asyncio.create_task(process_new(msg)))
