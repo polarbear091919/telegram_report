@@ -15,6 +15,7 @@ from collector import RunResult
 def test_parse_args_no_flags_defaults():
     args = parse_args([])
     assert args.cutoff_days is None
+    assert args.backfill_days is None
     assert args.dry_run is False
     assert args.verbose is False
 
@@ -59,3 +60,18 @@ def test_exit_code_partial_failure_in_stage_a():
 
 def test_exit_code_partial_failure_both_stages():
     assert compute_exit_code(RunResult(processed=2, failed=1, retried_fail=1)) == 2
+
+
+# === Backfill flag ===
+
+def test_parse_args_backfill_days():
+    args = parse_args(['--backfill-days', '365'])
+    assert args.backfill_days == 365
+    assert args.cutoff_days is None
+
+
+def test_parse_args_mutually_exclusive_raises_systemexit():
+    """argparse rejects --cutoff-days + --backfill-days combination."""
+    import pytest
+    with pytest.raises(SystemExit):
+        parse_args(['--cutoff-days', '30', '--backfill-days', '365'])

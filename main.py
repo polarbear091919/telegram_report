@@ -28,11 +28,19 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         prog='telegram_report',
         description='Collect PDF reports from a Telegram channel into Supabase + local FS.',
     )
-    p.add_argument(
+    mode = p.add_mutually_exclusive_group()
+    mode.add_argument(
         '--cutoff-days',
         type=int,
         default=None,
-        help='Override INITIAL_CUTOFF_DAYS for this run (only affects first run).',
+        help='Override INITIAL_CUTOFF_DAYS for this run (only effective on FIRST run when DB is empty).',
+    )
+    mode.add_argument(
+        '--backfill-days',
+        type=int,
+        default=None,
+        help='Backfill mode: fetch from N days ago, skip already-downloaded ones. '
+             'Ignores last_seen state. For one-off historical collection.',
     )
     p.add_argument(
         '--dry-run',
@@ -77,7 +85,7 @@ async def _amain(args: argparse.Namespace, config: Config) -> int:
         )
         if args.dry_run:
             return await _dry_run(client, storage, config)
-        result = await collector.run(client, storage, config)
+        result = await collector.run(client, storage, config, backfill_days=args.backfill_days)
         return compute_exit_code(result)
 
 
