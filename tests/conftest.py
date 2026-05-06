@@ -57,6 +57,33 @@ class FakeTelegramClient:
         return self.download_results.get(msg.id, b'fake pdf bytes')
 
 
+class TrackingFakeClient(FakeTelegramClient):
+    """FakeTelegramClient that records max concurrent download_pdf_bytes calls.
+
+    Used by concurrency tests to observe whether the collector's Semaphore
+    bound is honored.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.current_concurrent = 0
+        self.max_concurrent_observed = 0
+
+    async def download_pdf_bytes(self, msg) -> bytes:
+        self.calls.append(('download', msg.id))
+        self.current_concurrent += 1
+        self.max_concurrent_observed = max(
+            self.max_concurrent_observed, self.current_concurrent
+        )
+        # Yield to other tasks so concurrency can actually be observed
+        import asyncio
+        await asyncio.sleep(0.01)
+        self.current_concurrent -= 1
+        if msg.id in self.download_errors:
+            raise self.download_errors[msg.id]
+        return self.download_results.get(msg.id, b'fake pdf bytes')
+
+
 class FakeStorage:
     """In-memory fake matching the Storage interface used by collector."""
 

@@ -13,7 +13,11 @@ from tests.conftest import FakeStorage, FakeTelegramClient, make_msg
 def cfg():
     """Minimal config-shaped object."""
     from types import SimpleNamespace
-    return SimpleNamespace(telegram_channel='sunstudy1004', initial_cutoff_days=30)
+    return SimpleNamespace(
+        telegram_channel='sunstudy1004',
+        initial_cutoff_days=30,
+        max_concurrent_downloads=4,
+    )
 
 
 # === First-run behavior ===
@@ -187,3 +191,47 @@ async def test_run_returns_run_result_with_all_counters(fake_client, fake_storag
     for attr in ('processed', 'skipped', 'failed', 'retried_success', 'retried_fail'):
         assert hasattr(result, attr)
         assert getattr(result, attr) == 0
+
+
+# === Concurrency observation ===
+
+@pytest.mark.asyncio
+async def test_concurrency_respects_semaphore_limit(fake_storage):
+    """With N=3 and 10 messages, max concurrent downloads should be at most 3
+    AND at least 2 (proving real parallelism)."""
+    from types import SimpleNamespace
+    from tests.conftest import TrackingFakeClient
+
+    cfg = SimpleNamespace(
+        telegram_channel='sunstudy1004',
+        initial_cutoff_days=30,
+        max_concurrent_downloads=3,
+    )
+    client = TrackingFakeClient()
+    client.new_messages = [make_msg(100 + i) for i in range(10)]
+
+    await run(client, fake_storage, cfg)
+
+    assert client.max_concurrent_observed <= 3, \
+        f"Semaphore breach: {client.max_concurrent_observed} > 3"
+    assert client.max_concurrent_observed >= 2, \
+        f"No real parallelism observed (max={client.max_concurrent_observed})"
+
+
+@pytest.mark.asyncio
+async def test_concurrency_n1_is_serial(fake_storage):
+    """With N=1 (Semaphore(1)), only one download at a time."""
+    from types import SimpleNamespace
+    from tests.conftest import TrackingFakeClient
+
+    cfg = SimpleNamespace(
+        telegram_channel='sunstudy1004',
+        initial_cutoff_days=30,
+        max_concurrent_downloads=1,
+    )
+    client = TrackingFakeClient()
+    client.new_messages = [make_msg(100 + i) for i in range(5)]
+
+    await run(client, fake_storage, cfg)
+
+    assert client.max_concurrent_observed == 1

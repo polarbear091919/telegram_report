@@ -33,36 +33,46 @@ class RunResult:
 async def run(client: Any, storage: Any, config: Any) -> RunResult:
     """Run one collection cycle for the configured channel.
 
-    Stage A: re-attempt every msg_id currently in failed_attempts.
-    Stage B: fetch messages with id > max_seen and process them.
+    Stage A: re-attempt every msg_id currently in failed_attempts (parallelized).
+    Stage B: fetch messages with id > max_seen and process them (parallelized).
+
+    Both stages share a single Semaphore so total concurrent downloads
+    cannot exceed config.max_concurrent_downloads.
     """
+    import asyncio
+
     channel = config.telegram_channel
+    sem = asyncio.Semaphore(config.max_concurrent_downloads)
 
-    # === Stage A: retry past failures ===
+    # === Stage A: retry past failures (parallel) ===
     failed_ids = storage.get_failed_message_ids(channel)
-    log.info("Stage A: retrying %d previously failed messages", len(failed_ids))
-    retried_success = 0
-    retried_fail = 0
-    for msg_id in failed_ids:
-        msg = await client.get_message_by_id(channel, msg_id)
-        if msg is None or not has_pdf(msg):
-            # Message was deleted or its PDF attribute changed
-            log.info("Cleaning failed_attempts row for msg_id=%s (deleted or not PDF)", msg_id)
-            storage.remove_failed_attempt(channel, msg_id)
-            continue
-        try:
-            await _process_one_message(client, storage, channel, msg)
-            storage.remove_failed_attempt(channel, msg_id)
-            retried_success += 1
-        except Exception as e:
-            log.exception("Retry still failing for msg_id=%s", msg_id)
-            new_count = storage.upsert_failed_attempt(channel, msg_id, str(e))
-            if new_count >= ATTEMPT_WARN_THRESHOLD:
-                log.warning("msg_id=%s has failed %d times — investigate manually",
-                            msg_id, new_count)
-            retried_fail += 1
+    log.info("Stage A: retrying %d previously failed messages (concurrency=%d)",
+             len(failed_ids), config.max_concurrent_downloads)
 
-    # === Stage B: fetch new messages ===
+    async def retry_one(msg_id: int) -> str:
+        async with sem:
+            msg = await client.get_message_by_id(channel, msg_id)
+            if msg is None or not has_pdf(msg):
+                log.info("Cleaning failed_attempts row for msg_id=%s (deleted or not PDF)", msg_id)
+                storage.remove_failed_attempt(channel, msg_id)
+                return 'cleaned'
+            try:
+                await _process_one_message(client, storage, channel, msg)
+                storage.remove_failed_attempt(channel, msg_id)
+                return 'success'
+            except Exception as e:
+                log.exception("Retry still failing for msg_id=%s", msg_id)
+                new_count = storage.upsert_failed_attempt(channel, msg_id, str(e))
+                if new_count >= ATTEMPT_WARN_THRESHOLD:
+                    log.warning("msg_id=%s has failed %d times — investigate manually",
+                                msg_id, new_count)
+                return 'fail'
+
+    stage_a_results = await asyncio.gather(*[retry_one(mid) for mid in failed_ids])
+    retried_success = sum(1 for r in stage_a_results if r == 'success')
+    retried_fail = sum(1 for r in stage_a_results if r == 'fail')
+
+    # === Stage B: fetch new messages (parallel) ===
     last_seen = storage.get_max_seen_message_id(channel)
     log.info("Stage B: last_seen_message_id=%s", last_seen)
 
@@ -72,23 +82,30 @@ async def run(client: Any, storage: Any, config: Any) -> RunResult:
     else:
         message_iter = client.iter_messages_after_id(channel, last_seen)
 
-    processed = 0
+    async def process_new(msg) -> str:
+        async with sem:
+            try:
+                await _process_one_message(client, storage, channel, msg)
+                return 'processed'
+            except Exception as e:
+                log.exception("Failed to process message_id=%s", msg.id)
+                new_count = storage.upsert_failed_attempt(channel, msg.id, str(e))
+                if new_count >= ATTEMPT_WARN_THRESHOLD:
+                    log.warning("msg_id=%s has failed %d times — investigate manually",
+                                msg.id, new_count)
+                return 'failed'
+
+    tasks = []
     skipped = 0
-    failed = 0
     async for msg in message_iter:
         if not has_pdf(msg):
             skipped += 1
             continue
-        try:
-            await _process_one_message(client, storage, channel, msg)
-            processed += 1
-        except Exception as e:
-            log.exception("Failed to process message_id=%s", msg.id)
-            new_count = storage.upsert_failed_attempt(channel, msg.id, str(e))
-            if new_count >= ATTEMPT_WARN_THRESHOLD:
-                log.warning("msg_id=%s has failed %d times — investigate manually",
-                            msg.id, new_count)
-            failed += 1
+        tasks.append(asyncio.create_task(process_new(msg)))
+
+    stage_b_results = await asyncio.gather(*tasks)
+    processed = sum(1 for r in stage_b_results if r == 'processed')
+    failed = sum(1 for r in stage_b_results if r == 'failed')
 
     log.info(
         "Run complete. Stage A: retried_success=%d retried_fail=%d. "
