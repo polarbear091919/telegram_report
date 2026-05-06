@@ -41,10 +41,22 @@ See [design spec](docs/superpowers/specs/2026-05-05-telegram-report-collector-de
 
 | Command | Effect |
 |---|---|
-| `python main.py` | Normal run: collect new PDFs since last run |
+| `python main.py` | Normal run: collect new PDFs since last run (parallel by default, N=4) |
 | `python main.py --dry-run` | List what would be downloaded; write nothing |
-| `python main.py --cutoff-days 7` | Override INITIAL_CUTOFF_DAYS for this run |
+| `python main.py --cutoff-days 7` | Override INITIAL_CUTOFF_DAYS for this run (FIRST run only) |
+| `python main.py --backfill-days 365` | One-off historical backfill: fetch from N days ago, skip already-downloaded |
+| `python main.py --dry-run --backfill-days 365` | Preview backfill: count "new" vs "already-known skipped" before committing |
 | `python main.py -v` | Verbose (DEBUG level) logging |
+
+Mutually exclusive: `--cutoff-days` and `--backfill-days` cannot be used together.
+
+### Concurrency tuning
+
+`MAX_CONCURRENT_DOWNLOADS` env var (default `4`) controls how many PDFs
+download in parallel. Bump to `8` for faster backfill if FloodWait
+warnings are absent; lower to `1` for strictly sequential behavior.
+Single Semaphore is shared by Stage A retries and Stage B new fetches,
+so total in-flight downloads stay bounded.
 
 ### Exit codes
 
