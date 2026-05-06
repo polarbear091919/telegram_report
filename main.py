@@ -84,28 +84,55 @@ async def _amain(args: argparse.Namespace, config: Config) -> int:
             base_dir=config.storage_base_dir,
         )
         if args.dry_run:
-            return await _dry_run(client, storage, config)
+            return await _dry_run(client, storage, config, backfill_days=args.backfill_days)
         result = await collector.run(client, storage, config, backfill_days=args.backfill_days)
         return compute_exit_code(result)
 
 
-async def _dry_run(client, storage, config: Config) -> int:
-    """List which messages would be processed, without writing anything."""
+async def _dry_run(client, storage, config, backfill_days: int | None = None) -> int:
+    """List which messages would be processed, without writing anything.
+
+    With backfill_days set, mirrors the real backfill-mode dedupe: fetch
+    from N days ago and skip ids already in reports OR failed_attempts.
+    Reports separate counts of "new" vs "already-known skipped" so the
+    user can size disk and time before launching the real run (spec §1.3).
+    """
     from telegram_client import has_pdf, _get_original_filename
     channel = config.telegram_channel
-    last_seen = storage.get_max_seen_message_id(channel)
-    if last_seen == 0:
-        msgs = client.iter_messages_since_date(channel, config.initial_cutoff_days)
+
+    if backfill_days is not None:
+        existing_ids = storage.get_all_message_ids(channel)
+        existing_ids.update(storage.get_failed_message_ids(channel))
+        log.info(
+            "DRY RUN (backfill mode): %d existing message_ids will be skipped, "
+            "fetching from %d days ago",
+            len(existing_ids), backfill_days,
+        )
+        msgs = client.iter_messages_since_date(channel, backfill_days)
     else:
-        msgs = client.iter_messages_after_id(channel, last_seen)
+        existing_ids = None
+        last_seen = storage.get_max_seen_message_id(channel)
+        if last_seen == 0:
+            msgs = client.iter_messages_since_date(channel, config.initial_cutoff_days)
+        else:
+            msgs = client.iter_messages_after_id(channel, last_seen)
+
     log.info("DRY RUN — would process the following:")
     n = 0
+    n_skipped_existing = 0
     async for msg in msgs:
-        if has_pdf(msg):
-            log.info("  msg_id=%s sent_at=%s file=%s",
-                     msg.id, msg.date.isoformat(), _get_original_filename(msg))
-            n += 1
-    log.info("DRY RUN — total %d PDF messages", n)
+        if not has_pdf(msg):
+            continue
+        if existing_ids is not None and msg.id in existing_ids:
+            n_skipped_existing += 1
+            continue
+        log.info("  msg_id=%s sent_at=%s file=%s",
+                 msg.id, msg.date.isoformat(), _get_original_filename(msg))
+        n += 1
+
+    log.info("DRY RUN — total %d new PDF messages", n)
+    if existing_ids is not None:
+        log.info("DRY RUN — also %d already-known messages skipped", n_skipped_existing)
     return 0
 
 

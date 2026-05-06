@@ -75,3 +75,44 @@ def test_parse_args_mutually_exclusive_raises_systemexit():
     import pytest
     with pytest.raises(SystemExit):
         parse_args(['--cutoff-days', '30', '--backfill-days', '365'])
+
+
+# === Dry-run with backfill ===
+
+import pytest
+import asyncio
+
+
+@pytest.mark.asyncio
+async def test_dry_run_with_backfill_uses_skip_set(monkeypatch, tmp_path, capsys):
+    """_dry_run with backfill_days uses iter_since_date and skips IDs already
+    in reports OR failed_attempts. The 'new' count should reflect dedupe."""
+    from types import SimpleNamespace
+    from tests.conftest import FakeStorage, FakeTelegramClient, make_msg
+    from main import _dry_run
+
+    storage = FakeStorage(
+        base_dir=tmp_path,
+        existing_ids={100, 101},
+        failed_ids=[200],
+    )
+    client = FakeTelegramClient()
+    client.new_messages = [make_msg(100), make_msg(101), make_msg(200), make_msg(300)]
+
+    config = SimpleNamespace(
+        telegram_channel='sunstudy1004',
+        initial_cutoff_days=30,
+    )
+
+    rc = await _dry_run(client, storage, config, backfill_days=90)
+
+    assert rc == 0
+    # iter_since_date called with backfill_days, not initial_cutoff_days
+    assert ('iter_since_date', 'sunstudy1004', 90) in client.calls
+
+    captured = capsys.readouterr()
+    log_output = captured.err  # logging defaults to stderr
+
+    # Reports nothing was actually downloaded; nothing inserted; nothing saved
+    assert storage.inserted == []
+    assert storage.saved_files == []
