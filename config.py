@@ -22,6 +22,7 @@ class Config:
     supabase_service_key: str
     storage_base_dir: Path
     initial_cutoff_days: int
+    max_concurrent_downloads: int
     log_level: str
 
 
@@ -49,5 +50,6 @@ def load_config() -> Config:
         supabase_service_key=required('SUPABASE_SERVICE_KEY'),
         storage_base_dir=Path(os.getenv('STORAGE_BASE_DIR', './reports')),
         initial_cutoff_days=int(os.getenv('INITIAL_CUTOFF_DAYS', '30')),
+        max_concurrent_downloads=int(os.getenv('MAX_CONCURRENT_DOWNLOADS', '4')),
         log_level=os.getenv('LOG_LEVEL', 'INFO'),
     )

@@ -25,6 +25,7 @@ def test_load_config_happy_path(monkeypatch):
     assert cfg.telegram_session_path == Path('sessions') / 'samstudy'
     assert cfg.storage_base_dir == Path('./reports')
     assert cfg.initial_cutoff_days == 30
+    assert cfg.max_concurrent_downloads == 4
     assert cfg.log_level == 'INFO'
 
 
@@ -63,3 +64,31 @@ def test_load_config_optional_overrides(monkeypatch):
     assert cfg.storage_base_dir == Path('/tmp/my_reports')
     assert cfg.initial_cutoff_days == 7
     assert cfg.log_level == 'DEBUG'
+
+
+def test_load_config_max_concurrent_downloads_default(monkeypatch):
+    monkeypatch.setattr('config.load_dotenv', lambda *a, **k: False)
+    monkeypatch.setenv('TELEGRAM_API_ID', '12345')
+    monkeypatch.setenv('TELEGRAM_API_HASH', 'h')
+    monkeypatch.setenv('TELEGRAM_CHANNEL', 'c')
+    monkeypatch.setenv('SUPABASE_URL', 'u')
+    monkeypatch.setenv('SUPABASE_SERVICE_KEY', 'k')
+    monkeypatch.delenv('MAX_CONCURRENT_DOWNLOADS', raising=False)
+
+    cfg = load_config()
+
+    assert cfg.max_concurrent_downloads == 4
+
+
+def test_load_config_max_concurrent_downloads_override(monkeypatch):
+    monkeypatch.setattr('config.load_dotenv', lambda *a, **k: False)
+    monkeypatch.setenv('TELEGRAM_API_ID', '12345')
+    monkeypatch.setenv('TELEGRAM_API_HASH', 'h')
+    monkeypatch.setenv('TELEGRAM_CHANNEL', 'c')
+    monkeypatch.setenv('SUPABASE_URL', 'u')
+    monkeypatch.setenv('SUPABASE_SERVICE_KEY', 'k')
+    monkeypatch.setenv('MAX_CONCURRENT_DOWNLOADS', '8')
+
+    cfg = load_config()
+
+    assert cfg.max_concurrent_downloads == 8
