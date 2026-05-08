@@ -76,11 +76,12 @@
                            ▼ (row 1건마다 동시에 N개)
 ┌─────────────────────────────────────────────────────────────┐
 │  LangGraph row_graph (graph.py)                             │
-│   extract_pdf → llm_extract → oos_gate (3-way branch)       │
-│      ├─ OOS:         status_oos         → write             │
-│      ├─ unreadable:  status_unreadable  → write             │
+│   extract_pdf → llm_extract → oos_gate (routing-only,       │
+│                                3-way branch)                │
+│      ├─ OOS:         mark_oos_reason → status_oos → write   │
+│      ├─ unreadable:  status_unreadable               → write│
 │      └─ in-scope:    canonicalize → validate → enrich →     │
-│                       decide_status      → write             │
+│                       decide_status                  → write │
 └──────────────────────────┬──────────────────────────────────┘
                            ▼
                       Supabase (UPDATE)
@@ -433,11 +434,12 @@ class KRXIndex:
         # 추가 alias 룰은 vocabulary/taxonomy.yaml에 보강 가능
         return None
 
-    # NOTE: filter_products_by_membership는 본 spec에서 더 이상 사용하지 않음.
-    # 원 spec §6.6 정책 보존을 위해 KRX 미매칭 product는 silent drop이 아니라
-    # validate 노드가 products_unknown으로 분리하고 decide_status가
-    # review_needed/low로 처리한다. helper가 필요하면 KRXIndex.has_product(p)
-    # 같은 단순 멤버십 체크로 충분 (또는 validate가 직접 by_code 순회).
+    def has_product(self, product_token: str) -> bool:
+        """True if product_token appears as substring in any KRX row's products_text.
+        validate가 사용해 products_valid / products_unknown으로 분리한다.
+        silent drop 안 함 — 원 spec §6.6 정책 보존.
+        """
+        return any(product_token in e.products_text for e in self.by_code.values())
 
     def rows_with_product(self, product_token: str) -> list[KRXEntry]:
         """주요제품 셀에 product_token이 substring으로 들어간 KRX 행."""
@@ -674,7 +676,7 @@ def validate(state: RowState) -> dict:
     # products: KRX substring 멤버십 검증 (원 spec §6.6 정책 — silent drop 안 함)
     products_valid, products_unknown = [], []
     for p in raw.products:
-        if any(p in e.products_text for e in KRX.by_code.values()):
+        if KRX.has_product(p):
             products_valid.append(p)
         else:
             products_unknown.append(p)
@@ -967,20 +969,27 @@ SELECT 'oos:'||COALESCE(out_of_scope_reason,'none'), count(*)
 
 ### 9.2 Orchestrator (배치 루프)
 
+`lock_ttl_minutes`/`per_row_deadline_s`는 module-level 상수가 아니라 `run_batch()`의 명시 인자다. `cli.py`가 `load_config()`로 dotenv 로드 후 `cfg.lock_ttl_minutes` / `cfg.per_row_deadline_s`를 그대로 넘긴다. 이렇게 하면 orchestrator 모듈이 import-order에 따라 dotenv 전 env를 캐시하는 함정이 사라진다.
+
 ```python
 # orchestrator.py
-LOCK_TTL_MINUTES = 30           # stale lock 회수 임계 (env LOCK_TTL_MINUTES로 override)
-PER_ROW_DEADLINE_S = 90         # 한 row 처리에 허용되는 최대 시간 (env PER_ROW_DEADLINE_S)
-HEARTBEAT_INTERVAL_S = 30       # 처리 중 worker가 tagging_locked_at를 갱신하는 주기
-
-async def run_batch(*, batch_size, mode, dry_run, row_ids, model,
-                    max_concurrent_llm=10):
-    sb = SupabaseSQL.from_env()
-    client = AsyncOpenAI(max_retries=2, timeout=60.0)
-    worker_id = f"{socket.gethostname()}-{os.getpid()}-{secrets.token_hex(2)}"
-
+async def run_batch(
+    *,
+    sb,
+    client,
+    krx,
+    taxonomy_version: str,
+    batch_size: int,
+    dry_run: bool,
+    row_ids: list[int],
+    model: str,
+    max_concurrent_llm: int,
+    worker_id: str,
+    lock_ttl_minutes: int = 30,
+    per_row_deadline_s: float = 90.0,
+):
     if not row_ids and not dry_run:
-        await sb.execute(STALE_LOCK_RECLAIM_SQL, [LOCK_TTL_MINUTES])
+        await sb.execute(STALE_LOCK_RECLAIM_SQL, [lock_ttl_minutes])
 
     if row_ids:
         rows = await sb.fetch(ROW_IDS_FETCH_SQL, [row_ids])
@@ -989,39 +998,44 @@ async def run_batch(*, batch_size, mode, dry_run, row_ids, model,
     else:
         rows = await sb.fetch(ATOMIC_CLAIM_SQL, [worker_id, batch_size])
 
-    if not rows: return _empty_report()
+    if not rows: return _empty_report(model)
 
-    app = build_graph(client, sb, dry_run=dry_run)
+    app = build_graph(client, sb, krx=krx, dry_run=dry_run, taxonomy_version=taxonomy_version)
     sem = asyncio.Semaphore(max_concurrent_llm)
+
+    async def _revert(row_id: int) -> None:
+        if not dry_run and not row_ids:
+            try:
+                await sb.execute(REVERT_TO_PENDING_SQL, [row_id])
+            except Exception:
+                # REVERT가 실패하면 row가 'processing'으로 남고 stale-lock
+                # 회수가 lock_ttl_minutes 후 복구.
+                pass
 
     async def _process(row):
         async with sem:
             init_state = {**row, "worker_id": worker_id, "model": model}
             try:
-                # per-row deadline. timeout이면 row를 pending으로 되돌림 (정상 stale-lock 회수와 동일).
-                final = await asyncio.wait_for(app.ainvoke(init_state), timeout=PER_ROW_DEADLINE_S)
+                final = await asyncio.wait_for(app.ainvoke(init_state),
+                                                timeout=per_row_deadline_s)
                 return {"id": row["id"], **final}
             except OpenAITransientError as e:
-                if not dry_run and not row_ids:
-                    await sb.execute(REVERT_TO_PENDING_SQL, [row["id"]])
+                await _revert(row["id"])
                 return {"id": row["id"], "error": "transient", "detail": str(e)}
             except asyncio.TimeoutError:
-                if not dry_run and not row_ids:
-                    await sb.execute(REVERT_TO_PENDING_SQL, [row["id"]])
+                await _revert(row["id"])
                 return {"id": row["id"], "error": "deadline_exceeded"}
             except Exception as e:
-                # 알 수 없는 예외: row를 pending으로 두고(다음 실행에서 재시도) 보고에 기록.
-                # (write 단계가 일부만 진행됐다면 stale-lock 회수가 LOCK_TTL_MINUTES 후 복구.)
-                if not dry_run and not row_ids:
-                    await sb.execute(REVERT_TO_PENDING_SQL, [row["id"]])
+                # broad except로 gather() burst 방지.
+                await _revert(row["id"])
                 return {"id": row["id"], "error": "unhandled",
                         "detail": f"{type(e).__name__}:{e}"}
 
     results = await asyncio.gather(*[_process(r) for r in rows])
-    return _aggregate_report(results, dry_run=dry_run)
+    return _aggregate_report(results, dry_run=dry_run, model=model)
 ```
 
-**heartbeat (선택)**: per-row deadline이 짧으면 (예: PDF가 큰 경우) 워커가 처리 중 `tagging_locked_at = now()`를 주기적으로 갱신해 stale-lock 회수가 잘못 작동하는 것을 막는다. 구현은 `extract_pdf` 직후 `asyncio.create_task(_heartbeat(sb, row_id, HEARTBEAT_INTERVAL_S))`로 시작 후 `write` 진입 시 cancel. 본 spec에서는 옵션 (`HEARTBEAT_ENABLED=false` 기본값) — `LOCK_TTL_MINUTES > PER_ROW_DEADLINE_S/60` 보장하면 보통 불필요.
+**heartbeat (v1 미구현 — 후일 옵션)**: 매우 큰 PDF로 `per_row_deadline_s`가 길어져야 할 때, 워커가 처리 중 `tagging_locked_at = now()`를 주기적으로 갱신해 stale-lock 회수가 살아있는 워커를 잘못 회수하지 않게 한다. 구현 스케치: `extract_pdf` 직후 `asyncio.create_task(_heartbeat(sb, row_id, heartbeat_interval_s))`로 시작 후 `write` 진입 시 cancel. **본 v1에서는 구현하지 않음** — 운영 안전 제약 `lock_ttl_minutes * 60 > per_row_deadline_s`만 지키면 충분. config는 `heartbeat_enabled=false` / `heartbeat_interval_s=30`을 미래 호환을 위해 보존하지만 `run_batch()`에 전달하지 않는다 (Task 추가 없이 v2에서 도입).
 
 ### 9.3 에러 처리 / 재시도
 
@@ -1199,7 +1213,7 @@ pydantic>=2.7
 | §3.b 후보 필드 추출 | §7.2 `LLMExtraction` + §8.2 `llm_extract` (1회 호출) |
 | §3.b `llm_refusal` 처리 | §8.4.1 `status_unreadable` |
 | §3.c OOS 우선 판정 | §8.3 `oos_gate` (routing-only) + §8.3.1 `mark_oos_reason` + §8.4 `status_oos` |
-| §3.d Canonical 정규화 (publisher/topics/products) | §8.5 `canonicalize` (publisher/topics) + §8.6 `validate` (products KRX 멤버십) |
+| §3.d Canonical 정규화 (publisher/topics/products) | §8.5 `canonicalize` (publisher/topics) + §8.6 `validate` (products `KRX.has_product` 멤버십) |
 | §3.e CSV 검증 + 산업 깊이 | §8.6 `validate` + §8.7 `enrich` (`rows_with_product`/`rows_with_sector_minor`) |
 | §6.5 룰 4 IPO 경계 (KRX 미매칭 IPO in-scope) | §8.3 `oos_gate`의 private 분기 (IR자료 / KRX 매칭 / IPO 후보 모두 in-scope 유지) |
 | §6.6 `unknown_publisher` → review_needed/low | §8.8 `decide_status` (코드 정책) — 원 spec 정책 보존 |

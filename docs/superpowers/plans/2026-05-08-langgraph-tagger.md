@@ -4,7 +4,7 @@
 
 **Goal:** Port the existing `report-metadata-tagger` Claude/Codex skill to a Python pipeline driven by LangGraph 1.0 + OpenAI `gpt-5.4-mini → gpt-5.4` escalation. Preserve every decision rule from the 2026-05-07 routine spec while moving lookup/validation/enrichment/status decisions from LLM into deterministic Python code, with row-level concurrency via `asyncio.gather + Semaphore` over a single LangGraph row graph.
 
-**Architecture:** New sidecar package `langgraph_tagger/` (master modules untouched). LangGraph row graph runs one PDF at a time: `extract_pdf → llm_extract → oos_gate (3-way) → status_oos | status_unreadable | (canonicalize → validate → enrich → decide_status) → write`. Batch concurrency lives in `orchestrator.py` outside the graph. External 2-pass escalation: `run` (mini) → DB persists `review_needed` → `escalate` (gpt-5.4 with `row_ids`).
+**Architecture:** New sidecar package `langgraph_tagger/` (master modules untouched). LangGraph row graph runs one PDF at a time: `extract_pdf → llm_extract → oos_gate (routing-only, 3-way) → (mark_oos_reason → status_oos) | status_unreadable | (canonicalize → validate → enrich → decide_status) → write`. `oos_gate` returns only a label (LangGraph 1.0 contract); `mark_oos_reason` is a separate node that sets `is_oos`/`oos_reason` from LLM signals. Batch concurrency lives in `orchestrator.py` outside the graph. External 2-pass escalation: `run` (mini) → DB persists `review_needed` → `escalate` (gpt-5.4 with `row_ids`).
 
 **Tech Stack:** Python 3.10+, `langgraph>=1.0,<2.0`, `openai>=2.11` (vanilla AsyncOpenAI, no `langchain-openai`), `pymupdf>=1.24`, `pyyaml>=6.0`, `pydantic>=2.7`, `asyncpg>=0.29` (raw SQL on Supabase Postgres for atomic claim / stale lock / UPDATE), `pytest + pytest-asyncio`. Reference spec: `docs/superpowers/specs/2026-05-08-langgraph-tagger-design.md`.
 
@@ -268,6 +268,8 @@ SUPABASE_DB_URL=postgresql://postgres:<pw>@<host>:5432/postgres
 # never races a still-running worker.
 LOCK_TTL_MINUTES=30
 PER_ROW_DEADLINE_S=90
+# Heartbeat is reserved for v2 (not yet wired into run_batch). Keep these
+# vars unset or false in v1; orchestrator does not read them.
 HEARTBEAT_ENABLED=false
 HEARTBEAT_INTERVAL_S=30
 ```
@@ -959,15 +961,12 @@ class TestFuzzySectorMatch:
 
 
 class TestEnrichmentHelpers:
-    def test_filter_products_by_membership_keeps_known(self, krx):
-        out = krx.filter_products_by_membership(["DRAM", "NAND"])
-        # Both appear in many products_text cells
-        assert "DRAM" in out
-        assert "NAND" in out
+    def test_has_product_known(self, krx):
+        # 'DRAM' appears in many KRX 주요제품 cells
+        assert krx.has_product("DRAM") is True
 
-    def test_filter_products_by_membership_drops_unknown(self, krx):
-        out = krx.filter_products_by_membership(["완전이상한제품"])
-        assert out == []
+    def test_has_product_unknown(self, krx):
+        assert krx.has_product("완전이상한제품") is False
 
     def test_rows_with_product_returns_entries(self, krx):
         rows = krx.rows_with_product("DRAM")
@@ -1094,13 +1093,15 @@ class KRXIndex:
         # 2. Alias table from taxonomy.yaml (sector_major_aliases)
         return self._sector_aliases.get(norm)
 
-    def filter_products_by_membership(self, raw_products: list[str]) -> list[str]:
-        """Keep only product tokens that appear as substring in some KRX row's products_text."""
-        out = []
-        for p in raw_products:
-            if any(p in e.products_text for e in self.by_code.values()):
-                out.append(p)
-        return out
+    def has_product(self, product_token: str) -> bool:
+        """True if product_token appears as substring in any KRX row's products_text.
+
+        Used by validate node to split LLM-extracted products into
+        products_valid (KRX-known) / products_unknown (review_needed/low).
+        DOES NOT silently drop — caller must keep the unknown set visible
+        per spec §6.6.
+        """
+        return any(product_token in e.products_text for e in self.by_code.values())
 
     def rows_with_product(self, product_token: str) -> list[KRXEntry]:
         return [e for e in self.by_code.values() if product_token in e.products_text]
@@ -1165,7 +1166,7 @@ feat(tagger): KRX index loader + validation + enrichment helpers
 
 KRXIndex.load() handles the multi-line first header cell (종목\\n코드 → 종목코드)
 and utf-8-sig BOM. Helpers: validate_code, lookup, split_products,
-fuzzy_sector_match (Auto alias), filter_products_by_membership (substring rule
+fuzzy_sector_match (Auto alias), has_product (substring membership rule
 from spec §3.d), rows_with_product, rows_with_sector_minor. taxonomy_version
 derived from CSV mtime as KRX@YYYY-MM-DD.
 EOF
@@ -2620,10 +2621,11 @@ def validate(state: RowState, *, krx: KRXIndex) -> dict:
             s_unknown.append(s)
 
     # products: KRX substring 멤버십 검증 (spec §6.6 unknown_product → review_needed/low)
+    # has_product()는 silent drop 안 함 — products_unknown 분리해서 decide_status가 처리.
     products_valid: list[str] = []
     products_unknown: list[str] = []
     for p in raw.products:
-        if any(p in e.products_text for e in krx.by_code.values()):
+        if krx.has_product(p):
             products_valid.append(p)
         else:
             products_unknown.append(p)
@@ -4247,6 +4249,8 @@ class TaggerConfig:
     # Concurrency / lock safety knobs (spec §9.5)
     lock_ttl_minutes: int
     per_row_deadline_s: float
+    # Heartbeat: reserved for v2. Loaded from env for forward-compat but
+    # orchestrator does NOT consume these in v1 — see spec §9.2 note.
     heartbeat_enabled: bool
     heartbeat_interval_s: int
 
@@ -4873,7 +4877,7 @@ After this plan was written, here are the spec-coverage and consistency checks:
 
 All sections covered. No gaps.
 
-**Type consistency check:** `KRXIndex`, `RowState`, `LLMExtraction`, `OOSSignals` (with `foreign_primary_coverage`), `SupabaseSQL`, `OpenAITransientError`, function names (`lookup_publisher`, `map_topics`, `validate_code`, `lookup`, `split_products`, `fuzzy_sector_match`, `filter_products_by_membership`, `rows_with_product`, `rows_with_sector_minor`, `extract_pdf`, `llm_extract`, `oos_gate`, `mark_oos_reason`, `status_oos`, `status_unreadable`, `canonicalize`, `validate`, `enrich`, `decide_status`, `write`, `build_graph`, `run_batch`, `load_config`) — all consistent across tasks.
+**Type consistency check:** `KRXIndex`, `RowState`, `LLMExtraction`, `OOSSignals` (with `foreign_primary_coverage`), `SupabaseSQL`, `OpenAITransientError`, function names (`lookup_publisher`, `map_topics`, `validate_code`, `lookup`, `split_products`, `fuzzy_sector_match`, `has_product`, `rows_with_product`, `rows_with_sector_minor`, `extract_pdf`, `llm_extract`, `oos_gate`, `mark_oos_reason`, `status_oos`, `status_unreadable`, `canonicalize`, `validate`, `enrich`, `decide_status`, `write`, `build_graph`, `run_batch`, `load_config`) — all consistent across tasks.
 
 **Policy-change verification (revision 2):**
 - `unknown_publisher` → review_needed/low: Task 12 commit message + Task 15 test `test_unknown_publisher_yields_review_needed` + decide_status code branch + spec §6.6.
