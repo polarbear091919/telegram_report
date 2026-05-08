@@ -174,3 +174,75 @@ async def test_unhandled_exception_does_not_burst_gather(krx, mock_openai_client
     revert_calls = [args for sql, args in mock_supabase.executed
                     if "tagging_status='pending'" in sql and "id=$1" in sql]
     assert (11,) in revert_calls
+
+
+def test_empty_report_v2_oos_includes_ir_self():
+    """v2: _empty_report's oos dict has 5 keys including ir_self."""
+    from langgraph_tagger.orchestrator import _empty_report
+    rep = _empty_report("m")
+    assert set(rep["oos"].keys()) == {"foreign", "fund", "digital", "private", "ir_self"}
+    assert all(v == 0 for v in rep["oos"].values())
+    assert rep["review_reasons"] == {}
+
+
+def test_aggregate_oos_includes_ir_self():
+    """v2: oos_reason='ir_self' is counted alongside foreign/fund/digital/private."""
+    from langgraph_tagger.orchestrator import _aggregate
+    results = [
+        {"id": 1, "is_oos": True, "oos_reason": "ir_self", "tagging_status": "auto",
+         "tagging_confidence": "high"},
+        {"id": 2, "is_oos": True, "oos_reason": "foreign", "tagging_status": "auto",
+         "tagging_confidence": "high"},
+    ]
+    rep = _aggregate(results, model="m", batch_size=2, dry_run=False)
+    assert rep["oos"]["ir_self"] == 1
+    assert rep["oos"]["foreign"] == 1
+    assert rep["oos"]["fund"] == 0
+    assert rep["oos"]["digital"] == 0
+    assert rep["oos"]["private"] == 0
+
+
+def test_aggregate_review_reasons_v2_keys():
+    """v2: review_reasons set tracks first_page_unreadable, llm_refusal, type_indeterminate,
+    krx_unmatched_in_scope. unknown_* tags are no longer recognized."""
+    from langgraph_tagger.orchestrator import _aggregate
+    results = [
+        {"id": 1, "tagging_status": "review_needed",
+         "tagging_notes": "krx_unmatched_in_scope:ipo_pending_or_unknown"},
+        {"id": 2, "tagging_status": "review_needed",
+         "tagging_notes": "type_indeterminate"},
+    ]
+    rep = _aggregate(results, model="m", batch_size=2, dry_run=False)
+    assert rep["review_reasons"] == {
+        "krx_unmatched_in_scope": 1, "type_indeterminate": 1,
+    }
+
+
+def test_aggregate_review_reasons_ignores_v1_unknown_tags():
+    """v2 review_reasons set MUST NOT count v1 unknown_* tags (they're gone)."""
+    from langgraph_tagger.orchestrator import _aggregate
+    results = [
+        {"id": 1, "tagging_status": "review_needed",
+         "tagging_notes": "unknown_stock_code"},
+        {"id": 2, "tagging_status": "review_needed",
+         "tagging_notes": "unknown_sector;unknown_product"},
+        {"id": 3, "tagging_status": "review_needed",
+         "tagging_notes": "unknown_publisher"},
+    ]
+    rep = _aggregate(results, model="m", batch_size=3, dry_run=False)
+    # All v1 unknown_* tags are filtered out — review_reasons stays empty.
+    assert rep["review_reasons"] == {}
+
+
+def test_aggregate_review_reasons_handles_llm_refusal_with_detail():
+    """v2: llm_refusal:<error> note format — split(":", 1)[0] extracts the prefix."""
+    from langgraph_tagger.orchestrator import _aggregate
+    results = [
+        {"id": 1, "tagging_status": "review_needed",
+         "tagging_notes": "llm_refusal:rate_limit_exceeded"},
+        {"id": 2, "tagging_status": "review_needed",
+         "tagging_notes": "first_page_unreadable;llm_refusal:timeout"},
+    ]
+    rep = _aggregate(results, model="m", batch_size=2, dry_run=False)
+    assert rep["review_reasons"]["llm_refusal"] == 2
+    assert rep["review_reasons"]["first_page_unreadable"] == 1

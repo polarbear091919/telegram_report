@@ -106,7 +106,7 @@ def _empty_report(model: str) -> dict:
         "model": model, "processed": 0,
         "auto": 0, "review_needed": 0,
         "confidence": {"high": 0, "medium": 0, "low": 0},
-        "oos": {"foreign": 0, "fund": 0, "digital": 0, "private": 0},
+        "oos": {"foreign": 0, "fund": 0, "digital": 0, "private": 0, "ir_self": 0},
         "review_reasons": {},
         "transient_errors": 0,
         "deadline_errors": 0,
@@ -132,8 +132,7 @@ def _aggregate(results: list[dict], *, model: str, batch_size: int, dry_run: boo
                 continue
             tag = token.split(":", 1)[0]
             if tag in ("first_page_unreadable", "llm_refusal", "type_indeterminate",
-                       "unknown_stock_code", "unknown_sector",
-                       "unknown_product", "unknown_publisher"):
+                       "krx_unmatched_in_scope"):
                 review_reasons[tag] += 1
 
     return {
@@ -147,10 +146,11 @@ def _aggregate(results: list[dict], *, model: str, batch_size: int, dry_run: boo
             "low": conf_counter.get("low", 0),
         },
         "oos": {
-            "foreign": oos_counter.get("foreign", 0),
-            "fund": oos_counter.get("fund", 0),
-            "digital": oos_counter.get("digital", 0),
-            "private": oos_counter.get("private", 0),
+            "foreign":  oos_counter.get("foreign", 0),
+            "fund":     oos_counter.get("fund", 0),
+            "digital":  oos_counter.get("digital", 0),
+            "private":  oos_counter.get("private", 0),
+            "ir_self":  oos_counter.get("ir_self", 0),
         },
         "review_reasons": dict(review_reasons),
         "transient_errors": transient,
