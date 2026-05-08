@@ -1,6 +1,10 @@
 """Parity regression: run the row graph headlessly per fixture and assert
-the DB UPDATE payload matches the expected snapshot from friendly-mclaren
-skill outputs (or hand-curated equivalents).
+the DB UPDATE payload matches the expected snapshot.
+
+v2 변경 (rev-7):
+- UPDATE_SQL은 19-arg payload (Task 12)
+- LLMExtraction v2 schema (Task 5)
+- 6 report_types × 5 OOS reasons + mismatch 케이스
 
 This is the primary check that environment-change-only is honoured.
 """
@@ -19,6 +23,31 @@ from langgraph_tagger.supabase_io import UPDATE_SQL
 
 
 FIXTURES = Path(__file__).parent / "parity" / "fixtures.json"
+
+
+# v2 UPDATE_SQL bind args ($1..$19) → column names for readable assertions.
+# Order matches supabase_io.UPDATE_SQL.
+COLUMNS = [
+    "id",                    # $1
+    "published_at",          # $2
+    "report_type",           # $3
+    "publisher",             # $4
+    "publisher_type",        # $5
+    "analysts",              # $6
+    "title",                 # $7
+    "stock_codes",           # $8
+    "company_names",         # $9
+    "stock_codes_raw",       # $10
+    "company_names_raw",     # $11
+    "sectors_major",         # $12
+    "sectors_minor",         # $13
+    "products",              # $14
+    "out_of_scope_reason",   # $15
+    "tagging_status",        # $16
+    "tagging_confidence",    # $17
+    "tagging_notes",         # $18
+    "taxonomy_version",      # $19
+]
 
 
 def _load_fixtures() -> list[dict]:
@@ -63,28 +92,29 @@ async def test_parity(fix, krx, mock_openai_client, mock_supabase, monkeypatch, 
     }
     await app.ainvoke(init)
 
-    # Inspect the recorded UPDATE payload
+    # Inspect the recorded UPDATE payload — exactly one UPDATE per row.
     assert len(mock_supabase.executed) == 1
     sql, args = mock_supabase.executed[0]
     assert sql == UPDATE_SQL
+    assert len(args) == 19, f"v2 UPDATE_SQL expects 19 args, got {len(args)}"
 
-    # Map UPDATE bind args to dict for readable assertions
-    columns = [
-        "id", "published_at", "report_type", "publisher", "publisher_type",
-        "analysts", "title", "stock_codes", "company_names",
-        "sectors_major", "sectors_minor", "products", "topics",
-        "out_of_scope_reason", "tagging_status", "tagging_confidence",
-        "tagging_notes", "taxonomy_version",
-    ]
-    actual = dict(zip(columns, args))
-
+    actual = dict(zip(COLUMNS, args))
     expected = fix["expected"]
+
+    # List-valued columns: cast to list for stable comparison (asyncpg may
+    # return tuples and Python list literals in expected JSON come back as lists).
+    list_cols = {
+        "analysts", "stock_codes", "company_names",
+        "stock_codes_raw", "company_names_raw",
+        "sectors_major", "sectors_minor", "products",
+    }
+
     for k, v in expected.items():
-        if k.endswith("_contains"):
-            base = k[: -len("_contains")]
-            for item in v:
-                assert item in actual[base], (
-                    f"{base} missing {item} (got {actual[base]})"
-                )
+        if k in list_cols:
+            assert list(actual[k]) == v, (
+                f"{k}: expected {v!r}, got {actual[k]!r}"
+            )
         else:
-            assert actual[k] == v, f"{k}: expected {v!r}, got {actual[k]!r}"
+            assert actual[k] == v, (
+                f"{k}: expected {v!r}, got {actual[k]!r}"
+            )
