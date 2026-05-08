@@ -1,0 +1,501 @@
+[
+  {
+    "case": "single_stock",
+    "input": {
+      "file_name": "KT&G_2025_4Q_preview.pdf",
+      "caption": null,
+      "sent_at": "2026-04-30T09:00:00+00:00",
+      "pdf_text": "키움증권 리서치센터\n분석가: 홍길동\nKT&G [033780]\n투자의견: 매수 목표주가: 100,000원"
+    },
+    "llm_mock": {
+      "report_type": "단일종목",
+      "title": "KT&G 2025 4Q Preview",
+      "published_at": "2026-04-30",
+      "stock_codes_raw": ["033780"],
+      "company_names": ["KT&G"],
+      "sectors_major": ["음식료"],
+      "sectors_minor": ["식품"],
+      "products": ["담배"],
+      "publisher_raw": "키움증권",
+      "analysts": ["홍길동"],
+      "topics": ["배당"],
+      "oos_signals": {
+        "foreign_primary_coverage": false,
+        "etf_or_fund": false,
+        "digital_asset": false,
+        "private_company_likely": false
+      },
+      "self_confidence": "high",
+      "notes": null
+    },
+    "expected": {
+      "tagging_status": "auto",
+      "tagging_confidence": "high",
+      "out_of_scope_reason": null,
+      "report_type": "단일종목",
+      "publisher": "키움증권",
+      "publisher_type": "broker",
+      "stock_codes": ["033780"],
+      "company_names_contains": ["KT&G"],
+      "sectors_major_contains": ["음식료"],
+      "topics_contains": ["배당"],
+      "tagging_notes": null
+    }
+  },
+  {
+    "case": "industry",
+    "input": {
+      "file_name": "semiconductor_industry_2025_outlook.pdf",
+      "caption": null,
+      "sent_at": "2026-05-01T09:00:00+00:00",
+      "pdf_text": "키움증권 리서치센터\n분석가 김철수\n반도체 산업분석 2025년 메모리 사이클 전망\nHBM 수요 확대 전망"
+    },
+    "llm_mock": {
+      "report_type": "산업",
+      "title": "반도체 산업: 2025년 메모리 사이클 전망",
+      "published_at": "2026-05-01",
+      "stock_codes_raw": [],
+      "company_names": [],
+      "sectors_major": ["반도체"],
+      "sectors_minor": ["메모리반도체"],
+      "products": ["DRAM", "NAND"],
+      "publisher_raw": "키움증권",
+      "analysts": ["김철수"],
+      "topics": ["HBM", "AI수혜"],
+      "oos_signals": {
+        "foreign_primary_coverage": false,
+        "etf_or_fund": false,
+        "digital_asset": false,
+        "private_company_likely": false
+      },
+      "self_confidence": "high",
+      "notes": null
+    },
+    "expected": {
+      "tagging_status": "auto",
+      "tagging_confidence": "high",
+      "out_of_scope_reason": null,
+      "report_type": "산업",
+      "publisher": "키움증권",
+      "publisher_type": "broker",
+      "stock_codes": [],
+      "sectors_major_contains": ["반도체"],
+      "sectors_minor_contains": ["메모리반도체"],
+      "topics_contains": ["HBM", "AI수혜"],
+      "tagging_notes": null
+    }
+  },
+  {
+    "case": "daily_market",
+    "input": {
+      "file_name": "Daily_Market_2026-05-08.pdf",
+      "caption": null,
+      "sent_at": "2026-05-08T09:00:00+00:00",
+      "pdf_text": "키움증권 리서치센터\n분석가 이영희\nDaily Market 시황 코멘트\n외국인 순매도 지속 기관 매수 우위"
+    },
+    "llm_mock": {
+      "report_type": "시황·데일리",
+      "title": "Daily Market 2026-05-08",
+      "published_at": "2026-05-08",
+      "stock_codes_raw": [],
+      "company_names": [],
+      "sectors_major": [],
+      "sectors_minor": [],
+      "products": [],
+      "publisher_raw": "키움증권",
+      "analysts": ["이영희"],
+      "topics": ["외국인수급", "기관수급"],
+      "oos_signals": {
+        "foreign_primary_coverage": false,
+        "etf_or_fund": false,
+        "digital_asset": false,
+        "private_company_likely": false
+      },
+      "self_confidence": "high",
+      "notes": null
+    },
+    "expected": {
+      "tagging_status": "auto",
+      "tagging_confidence": "high",
+      "out_of_scope_reason": null,
+      "report_type": "시황·데일리",
+      "publisher": "키움증권",
+      "publisher_type": "broker",
+      "stock_codes": [],
+      "topics_contains": ["외국인수급", "기관수급"],
+      "tagging_notes": null
+    }
+  },
+  {
+    "case": "ipo_listed",
+    "input": {
+      "file_name": "saebitchem_107600_IPO_update.pdf",
+      "caption": null,
+      "sent_at": "2026-05-02T09:00:00+00:00",
+      "pdf_text": "키움증권 리서치센터\n분석가 박민수\n새빗켐 [107600] IPO 기업 업데이트\n투자의견: 매수"
+    },
+    "llm_mock": {
+      "report_type": "단일종목",
+      "title": "새빗켐 IPO 기업 업데이트",
+      "published_at": "2026-05-02",
+      "stock_codes_raw": ["107600"],
+      "company_names": ["새빗켐"],
+      "sectors_major": ["배터리"],
+      "sectors_minor": ["배터리_소재"],
+      "products": ["리사이클링"],
+      "publisher_raw": "키움증권",
+      "analysts": ["박민수"],
+      "topics": ["IPO"],
+      "oos_signals": {
+        "foreign_primary_coverage": false,
+        "etf_or_fund": false,
+        "digital_asset": false,
+        "private_company_likely": false
+      },
+      "self_confidence": "high",
+      "notes": null
+    },
+    "expected": {
+      "tagging_status": "auto",
+      "tagging_confidence": "high",
+      "out_of_scope_reason": null,
+      "report_type": "단일종목",
+      "publisher": "키움증권",
+      "publisher_type": "broker",
+      "stock_codes": ["107600"],
+      "company_names_contains": ["새빗켐"],
+      "sectors_major_contains": ["배터리"],
+      "topics_contains": ["IPO"],
+      "tagging_notes": null
+    }
+  },
+  {
+    "case": "ipo_unlisted",
+    "input": {
+      "file_name": "IPO_unlisted_pharma_listing.pdf",
+      "caption": null,
+      "sent_at": "2026-05-03T09:00:00+00:00",
+      "pdf_text": "키움증권 리서치센터\n분석가 이영수\nIPO 예정기업 분석\n공모 상장 예정"
+    },
+    "llm_mock": {
+      "report_type": "IPO",
+      "title": "IPO 예정 기업 상장 분석",
+      "published_at": "2026-05-03",
+      "stock_codes_raw": [],
+      "company_names": ["NewPharma"],
+      "sectors_major": [],
+      "sectors_minor": [],
+      "products": [],
+      "publisher_raw": "키움증권",
+      "analysts": ["이영수"],
+      "topics": ["IPO"],
+      "oos_signals": {
+        "foreign_primary_coverage": false,
+        "etf_or_fund": false,
+        "digital_asset": false,
+        "private_company_likely": false
+      },
+      "self_confidence": "high",
+      "notes": null
+    },
+    "expected": {
+      "tagging_status": "auto",
+      "tagging_confidence": "high",
+      "out_of_scope_reason": null,
+      "report_type": "IPO",
+      "publisher": "키움증권",
+      "publisher_type": "broker",
+      "stock_codes": [],
+      "company_names_contains": ["NewPharma"],
+      "topics_contains": ["IPO"],
+      "tagging_notes": null
+    }
+  },
+  {
+    "case": "ir_company_self",
+    "input": {
+      "file_name": "company_self_IR_material_3Q26.pdf",
+      "caption": null,
+      "sent_at": "2026-05-04T09:00:00+00:00",
+      "pdf_text": "Investor Relations Material\nIR자료 3분기 실적 발표\n해당기업"
+    },
+    "llm_mock": {
+      "report_type": "IR자료",
+      "title": "Company Self IR Material 3Q26",
+      "published_at": "2026-05-04",
+      "stock_codes_raw": [],
+      "company_names": ["SelfIRCo"],
+      "sectors_major": [],
+      "sectors_minor": [],
+      "products": [],
+      "publisher_raw": "해당기업",
+      "analysts": [],
+      "topics": ["가이던스"],
+      "oos_signals": {
+        "foreign_primary_coverage": false,
+        "etf_or_fund": false,
+        "digital_asset": false,
+        "private_company_likely": false
+      },
+      "self_confidence": "high",
+      "notes": null
+    },
+    "expected": {
+      "tagging_status": "auto",
+      "tagging_confidence": "high",
+      "out_of_scope_reason": null,
+      "report_type": "IR자료",
+      "publisher": "해당기업",
+      "publisher_type": "company",
+      "stock_codes": [],
+      "company_names_contains": ["SelfIRCo"],
+      "topics_contains": ["가이던스"],
+      "tagging_notes": null
+    }
+  },
+  {
+    "case": "domestic_with_foreign_peer",
+    "input": {
+      "file_name": "samsung_005930_with_aapl_peer.pdf",
+      "caption": null,
+      "sent_at": "2026-05-05T09:00:00+00:00",
+      "pdf_text": "키움증권 리서치센터\n분석가 김지수\n삼성전자 [005930] 분석\nAAPL NVDA peer 비교 포함"
+    },
+    "llm_mock": {
+      "report_type": "단일종목",
+      "title": "삼성전자 1Q26 Preview (with AAPL/NVDA peers)",
+      "published_at": "2026-05-05",
+      "stock_codes_raw": ["005930"],
+      "company_names": ["삼성전자"],
+      "sectors_major": ["반도체"],
+      "sectors_minor": ["메모리반도체"],
+      "products": ["DRAM"],
+      "publisher_raw": "키움증권",
+      "analysts": ["김지수"],
+      "topics": ["AI수혜"],
+      "oos_signals": {
+        "foreign_primary_coverage": false,
+        "etf_or_fund": false,
+        "digital_asset": false,
+        "private_company_likely": false
+      },
+      "self_confidence": "high",
+      "notes": "AAPL/NVDA mentioned only as peers"
+    },
+    "expected": {
+      "tagging_status": "auto",
+      "tagging_confidence": "high",
+      "out_of_scope_reason": null,
+      "report_type": "단일종목",
+      "publisher": "키움증권",
+      "publisher_type": "broker",
+      "stock_codes": ["005930"],
+      "company_names_contains": ["삼성전자"],
+      "sectors_major_contains": ["반도체"],
+      "topics_contains": ["AI수혜"],
+      "tagging_notes": null
+    }
+  },
+  {
+    "case": "foreign_primary",
+    "input": {
+      "file_name": "Disney_DIS_1Q26_preview.pdf",
+      "caption": null,
+      "sent_at": "2026-05-06T09:00:00+00:00",
+      "pdf_text": "키움증권 리서치센터\n분석가 최선아\nDisney (DIS) 1Q26 Preview\nNetflix peer comparison"
+    },
+    "llm_mock": {
+      "report_type": "기타",
+      "title": "Disney (DIS) 1Q26 Preview",
+      "published_at": "2026-05-06",
+      "stock_codes_raw": [],
+      "company_names": ["Disney"],
+      "sectors_major": [],
+      "sectors_minor": [],
+      "products": [],
+      "publisher_raw": "키움증권",
+      "analysts": ["최선아"],
+      "topics": [],
+      "oos_signals": {
+        "foreign_primary_coverage": true,
+        "etf_or_fund": false,
+        "digital_asset": false,
+        "private_company_likely": false
+      },
+      "self_confidence": "high",
+      "notes": null
+    },
+    "expected": {
+      "tagging_status": "auto",
+      "tagging_confidence": "high",
+      "out_of_scope_reason": "foreign",
+      "report_type": "기타",
+      "publisher": null,
+      "publisher_type": null,
+      "stock_codes": [],
+      "tagging_notes": null
+    }
+  },
+  {
+    "case": "etf_lineup",
+    "input": {
+      "file_name": "global_etf_lineup_guide.pdf",
+      "caption": null,
+      "sent_at": "2026-05-06T10:00:00+00:00",
+      "pdf_text": "키움증권 리서치센터\n분석가 한지민\nGlobal ETF 라인업 가이드\n월간 ETF 비교"
+    },
+    "llm_mock": {
+      "report_type": "기타",
+      "title": "Global ETF 라인업 가이드",
+      "published_at": "2026-05-06",
+      "stock_codes_raw": [],
+      "company_names": [],
+      "sectors_major": [],
+      "sectors_minor": [],
+      "products": [],
+      "publisher_raw": "키움증권",
+      "analysts": ["한지민"],
+      "topics": [],
+      "oos_signals": {
+        "foreign_primary_coverage": false,
+        "etf_or_fund": true,
+        "digital_asset": false,
+        "private_company_likely": false
+      },
+      "self_confidence": "high",
+      "notes": null
+    },
+    "expected": {
+      "tagging_status": "auto",
+      "tagging_confidence": "high",
+      "out_of_scope_reason": "fund",
+      "report_type": "기타",
+      "publisher": null,
+      "publisher_type": null,
+      "stock_codes": [],
+      "tagging_notes": null
+    }
+  },
+  {
+    "case": "unknown_publisher_in_scope",
+    "input": {
+      "file_name": "unknown_boutique_005930_report.pdf",
+      "caption": null,
+      "sent_at": "2026-05-07T09:00:00+00:00",
+      "pdf_text": "UnknownBoutique Research\n분석가 미상\n삼성전자 [005930] Brief\n투자의견 매수"
+    },
+    "llm_mock": {
+      "report_type": "단일종목",
+      "title": "삼성전자 Brief by UnknownBoutique",
+      "published_at": "2026-05-07",
+      "stock_codes_raw": ["005930"],
+      "company_names": ["삼성전자"],
+      "sectors_major": ["반도체"],
+      "sectors_minor": ["메모리반도체"],
+      "products": ["DRAM"],
+      "publisher_raw": "UnknownBoutique",
+      "analysts": ["미상"],
+      "topics": ["AI수혜"],
+      "oos_signals": {
+        "foreign_primary_coverage": false,
+        "etf_or_fund": false,
+        "digital_asset": false,
+        "private_company_likely": false
+      },
+      "self_confidence": "high",
+      "notes": null
+    },
+    "expected": {
+      "tagging_status": "review_needed",
+      "tagging_confidence": "low",
+      "out_of_scope_reason": null,
+      "report_type": "단일종목",
+      "publisher": null,
+      "publisher_type": null,
+      "stock_codes": ["005930"],
+      "company_names_contains": ["삼성전자"],
+      "tagging_notes": "unknown_publisher:UnknownBoutique"
+    }
+  },
+  {
+    "case": "unknown_product_in_scope",
+    "input": {
+      "file_name": "samsung_005930_with_unknown_product.pdf",
+      "caption": null,
+      "sent_at": "2026-05-07T10:00:00+00:00",
+      "pdf_text": "키움증권 리서치센터\n분석가 정수민\n삼성전자 [005930] 신제품 분석\n투자의견 매수 목표주가 100,000원"
+    },
+    "llm_mock": {
+      "report_type": "단일종목",
+      "title": "삼성전자 New Product Analysis",
+      "published_at": "2026-05-07",
+      "stock_codes_raw": ["005930"],
+      "company_names": ["삼성전자"],
+      "sectors_major": ["반도체"],
+      "sectors_minor": ["메모리반도체"],
+      "products": ["완전이상한제품"],
+      "publisher_raw": "키움증권",
+      "analysts": ["정수민"],
+      "topics": ["AI수혜"],
+      "oos_signals": {
+        "foreign_primary_coverage": false,
+        "etf_or_fund": false,
+        "digital_asset": false,
+        "private_company_likely": false
+      },
+      "self_confidence": "high",
+      "notes": null
+    },
+    "expected": {
+      "tagging_status": "review_needed",
+      "tagging_confidence": "low",
+      "out_of_scope_reason": null,
+      "report_type": "단일종목",
+      "publisher": "키움증권",
+      "publisher_type": "broker",
+      "stock_codes": ["005930"],
+      "company_names_contains": ["삼성전자"],
+      "tagging_notes": "unknown_product:완전이상한제품"
+    }
+  },
+  {
+    "case": "digital_btc",
+    "input": {
+      "file_name": "BTC_digital_asset_outlook.pdf",
+      "caption": null,
+      "sent_at": "2026-05-08T09:00:00+00:00",
+      "pdf_text": "NH투자증권 리서치센터\n분석가 김디지\n디지털자산 BTC 분석\n가상자산 ETF 출시 영향"
+    },
+    "llm_mock": {
+      "report_type": "기타",
+      "title": "BTC 디지털자산 동향",
+      "published_at": "2026-05-08",
+      "stock_codes_raw": [],
+      "company_names": [],
+      "sectors_major": [],
+      "sectors_minor": [],
+      "products": [],
+      "publisher_raw": "NH투자증권",
+      "analysts": ["김디지"],
+      "topics": [],
+      "oos_signals": {
+        "foreign_primary_coverage": false,
+        "etf_or_fund": false,
+        "digital_asset": true,
+        "private_company_likely": false
+      },
+      "self_confidence": "high",
+      "notes": null
+    },
+    "expected": {
+      "tagging_status": "auto",
+      "tagging_confidence": "high",
+      "out_of_scope_reason": "digital",
+      "report_type": "기타",
+      "publisher": null,
+      "publisher_type": null,
+      "stock_codes": [],
+      "tagging_notes": null
+    }
+  }
+]
