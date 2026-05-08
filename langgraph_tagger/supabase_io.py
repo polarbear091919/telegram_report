@@ -57,7 +57,7 @@ UPDATE reports
  WHERE id=$1 AND tagging_status='processing'
 """
 
-# Note: in-scope and OOS rows use the same UPDATE statement; the payload differs.
+# Note: in-scope, OOS, unreadable rows all share this UPDATE; payload semantics differ.
 UPDATE_SQL = """
 UPDATE reports
    SET published_at=$2,
@@ -68,19 +68,20 @@ UPDATE reports
        title=$7,
        stock_codes=$8,
        company_names=$9,
-       sectors_major=$10,
-       sectors_minor=$11,
-       products=$12,
-       topics=$13,
-       out_of_scope_reason=$14,
-       tagging_status=$15,
-       tagging_confidence=$16,
-       tagging_notes=$17,
+       stock_codes_raw=$10,
+       company_names_raw=$11,
+       sectors_major=$12,
+       sectors_minor=$13,
+       products=$14,
+       out_of_scope_reason=$15,
+       tagging_status=$16,
+       tagging_confidence=$17,
+       tagging_notes=$18,
        tagging_locked_at=NULL,
        tagging_worker_id=NULL,
        tagged_at=now(),
-       tagger_version='langgraph-tagger@1.0',
-       taxonomy_version=$18
+       tagger_version='langgraph-tagger@2.0',
+       taxonomy_version=$19
  WHERE id=$1
 """
 

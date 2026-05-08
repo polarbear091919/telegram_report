@@ -20,11 +20,21 @@ def test_dry_run_select_does_not_mutate():
     assert "UPDATE" not in DRY_RUN_SELECT_SQL
 
 
-def test_update_has_18_bound_params():
-    # Count $N placeholders
+def test_update_sql_has_19_placeholders():
     import re
-    params = sorted(set(int(m) for m in re.findall(r"\$(\d+)", UPDATE_SQL)))
-    assert params == list(range(1, 19))
+    placeholders = set(re.findall(r"\$\d+", UPDATE_SQL))
+    expected = {f"${i}" for i in range(1, 20)}
+    assert placeholders == expected
+
+
+def test_update_sql_has_raw_audit_columns():
+    assert "stock_codes_raw=$10" in UPDATE_SQL
+    assert "company_names_raw=$11" in UPDATE_SQL
+    assert "topics" not in UPDATE_SQL
+
+
+def test_update_sql_tagger_version_is_2_0():
+    assert "tagger_version='langgraph-tagger@2.0'" in UPDATE_SQL
 
 
 def test_escalation_pick_filters_by_status_and_date():
