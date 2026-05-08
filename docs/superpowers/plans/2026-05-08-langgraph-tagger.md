@@ -3814,11 +3814,13 @@ Expected: 2 tests PASS.
 ```bash
 git add langgraph_tagger/graph.py langgraph_tagger/tests/test_graph.py
 git commit -m "$(cat <<'EOF'
-feat(tagger): assemble StateGraph with 9 nodes + 3-way conditional edge
+feat(tagger): assemble StateGraph with 10 nodes + 3-way conditional edge
 
 Nodes wired with partial() to inject client/sb/krx/dry_run/taxonomy_version.
-Conditional edge from llm_extract routes to status_oos / status_unreadable /
-canonicalize. End-to-end smoke tests verify both OOS and unreadable paths.
+Conditional edge from llm_extract routes to mark_oos_reason / status_unreadable /
+canonicalize. mark_oos_reason → status_oos sets is_oos and oos_reason from LLM
+signals (separated from oos_gate to honour LangGraph 1.0 routing-only contract).
+End-to-end smoke tests verify both OOS and unreadable paths.
 EOF
 )"
 ```
@@ -3960,10 +3962,9 @@ async def test_empty_claim_returns_zero_processed(krx, mock_openai_client, mock_
 
 
 @pytest.mark.asyncio
-async def test_per_row_deadline_reverts_to_pending(krx, mock_openai_client, mock_supabase, make_pdf, monkeypatch):
+async def test_per_row_deadline_reverts_to_pending(krx, mock_openai_client, mock_supabase, make_pdf):
     """Long-running rows should hit asyncio.wait_for and REVERT."""
     import asyncio
-    monkeypatch.setattr("langgraph_tagger.orchestrator.PER_ROW_DEADLINE_S", 0.01)
     mock_supabase.queue_fetch([_row(7)])
 
     async def _slow(*a, **kw):
@@ -3976,11 +3977,12 @@ async def test_per_row_deadline_reverts_to_pending(krx, mock_openai_client, mock
         taxonomy_version="KRX@2026-05-08",
         batch_size=10, dry_run=False, row_ids=[],
         model="gpt-5.4-mini", max_concurrent_llm=4, worker_id="w1",
+        # Pass an aggressive deadline as an explicit arg — no env / module-level state.
+        lock_ttl_minutes=30, per_row_deadline_s=0.01,
     )
     assert any("tagging_status='pending'" in sql and args == (7,)
                for sql, args in mock_supabase.executed)
-    # report should record the deadline error
-    assert report["transient_errors"] + report.get("deadline_errors", 0) >= 1
+    assert report.get("deadline_errors", 0) >= 1
 
 
 @pytest.mark.asyncio
@@ -4020,13 +4022,17 @@ async def test_unhandled_exception_does_not_burst_gather(krx, mock_openai_client
 """Batch orchestration: claim → fan-out via Semaphore → aggregate.
 
 Per-row deadline + broad except boundary so a single row failure cannot crash
-asyncio.gather() and leave others stuck in 'processing'. LOCK_TTL_MINUTES is
+asyncio.gather() and leave others stuck in 'processing'. lock_ttl_minutes is
 bound to STALE_LOCK_RECLAIM_SQL via $1.
+
+NOTE: env values are NOT read at module import time. The CLI loads .env via
+config.load_config() and passes lock_ttl_minutes / per_row_deadline_s into
+run_batch() explicitly. This avoids the import-order trap where the
+orchestrator module is imported before dotenv has been loaded.
 """
 from __future__ import annotations
 
 import asyncio
-import os
 from collections import Counter
 from typing import Any
 
@@ -4037,10 +4043,6 @@ from langgraph_tagger.supabase_io import (
     ROW_IDS_FETCH_SQL, STALE_LOCK_RECLAIM_SQL,
 )
 from langgraph_tagger.vocabulary.krx import KRXIndex
-
-# Read at import time; tests can monkeypatch the module attributes for deadlines.
-LOCK_TTL_MINUTES = int(os.environ.get("LOCK_TTL_MINUTES", "30"))
-PER_ROW_DEADLINE_S = float(os.environ.get("PER_ROW_DEADLINE_S", "90"))
 
 
 async def run_batch(
@@ -4055,6 +4057,8 @@ async def run_batch(
     model: str,
     max_concurrent_llm: int,
     worker_id: str,
+    lock_ttl_minutes: int = 30,
+    per_row_deadline_s: float = 90.0,
 ) -> dict[str, Any]:
     """Process a batch of pending reports.
 
@@ -4062,9 +4066,9 @@ async def run_batch(
     - dry_run mode: SELECT only, no status mutation
     - row_ids mode: skip claim, fetch by id, status not mutated even if not 'pending'
     """
-    # 1. stale lock reclaim (only in normal run mode). LOCK_TTL_MINUTES bound.
+    # 1. stale lock reclaim (only in normal run mode). lock_ttl_minutes bound.
     if not row_ids and not dry_run:
-        await sb.execute(STALE_LOCK_RECLAIM_SQL, [LOCK_TTL_MINUTES])
+        await sb.execute(STALE_LOCK_RECLAIM_SQL, [lock_ttl_minutes])
 
     # 2. fetch rows
     if row_ids:
@@ -4096,7 +4100,7 @@ async def run_batch(
             try:
                 final = await asyncio.wait_for(
                     app.ainvoke(init_state),
-                    timeout=PER_ROW_DEADLINE_S,
+                    timeout=per_row_deadline_s,
                 )
                 return {"id": row["id"], **final}
             except OpenAITransientError as e:
@@ -4316,6 +4320,8 @@ async def _cmd_run(args, cfg):
             model=args.model or cfg.model_default,
             max_concurrent_llm=args.max_concurrent_llm or cfg.max_concurrent_llm,
             worker_id=_make_worker_id(),
+            lock_ttl_minutes=cfg.lock_ttl_minutes,
+            per_row_deadline_s=cfg.per_row_deadline_s,
         )
         print(json.dumps(report, indent=2, ensure_ascii=False, default=str))
     finally:
@@ -4354,6 +4360,8 @@ async def _cmd_escalate(args, cfg):
             model=args.model or cfg.model_escalation,
             max_concurrent_llm=args.max_concurrent_llm or cfg.max_concurrent_llm,
             worker_id=_make_worker_id(),
+            lock_ttl_minutes=cfg.lock_ttl_minutes,
+            per_row_deadline_s=cfg.per_row_deadline_s,
         )
         print(json.dumps(report, indent=2, ensure_ascii=False, default=str))
     finally:
@@ -4450,16 +4458,26 @@ payload) and the test runs the entire row graph headlessly.
 git ls-tree -r --name-only claude/friendly-mclaren-815e01 | Select-String "report-metadata-tagger-workspace.*result\.json"
 ```
 
-If result.json files exist, use them as parity ground truth (Step 2). If
-nothing exists or coverage is sparse (<6 cases), fall through to Step 3 and
-hand-write fixtures based on the spec.
+The friendly-mclaren `result.json` files typically capture only the **final
+row state** (publisher canonical, report_type, status, OOS reason, etc.) — they
+were the skill's output, not its input. Treat them as **expected output ground
+truth only**. The input side (`pdf_text`, `caption`, `sent_at`) and the LLM
+mock response (`llm_mock` field below) must be **hand-curated** to feed the
+graph headlessly.
 
-- [ ] **Step 2: Extract and convert ground truth (when available)**
+- [ ] **Step 2: Build fixtures (hand-curate input + reuse result.json for expected)**
 
-For each `result.json` found, extract: file_path/file_name (input), the
-LLM-extracted candidate fields (mock-able), and the final DB row state
-(expected). Save to `langgraph_tagger/tests/parity/fixtures.json` as a
-list of objects:
+For each case:
+- **expected**: copy from a `result.json` row when one exists; otherwise
+  derive from spec rules and KRX entries.
+- **input** (`file_name`, `caption`, `sent_at`, `pdf_text`): hand-author a
+  short representative first-page text that triggers the case. PDFs are
+  synthesized in the test fixture (no need for real PDFs in parity).
+- **llm_mock**: hand-author the `LLMExtraction` payload that GPT-5.4-mini
+  *should* return for the input. This is what makes the test deterministic
+  and isolates the graph from real OpenAI calls.
+
+Save to `langgraph_tagger/tests/parity/fixtures.json` as a list of objects:
 
 ```json
 [
@@ -4526,9 +4544,11 @@ Cases to cover (≥10):
 
 - [ ] **Step 3: Write fixtures.json**
 
-If Step 2 yielded data, paste it. Otherwise hand-author the same shape from
-spec rules + KRX entries the implementer chooses (must include all 12
-cases above).
+Paste in the curated objects from Step 2. Must include all 12 cases above.
+Each object must validate against the schema (input keys + llm_mock keys
+matching `LLMExtraction` field names + expected keys). When there is no
+matching `result.json`, document the source of the expected values inline
+in `parity/README.md`.
 
 - [ ] **Step 4: Write the parity test**
 
@@ -4679,7 +4699,7 @@ Required cases not yet covered by Task 8 fixtures:
 | `domestic_with_foreign_peer.pdf` | `"키움증권 삼성전자 1Q26 Preview\n분석가 홍길동\nNVDA H100 수요 ↑"` (국내 단일종목, NVDA peer 언급) |
 | `ir_company_self.pdf` | `"휴온스 Investor Relations\nIR Material 2026.04\n비상장 자회사 현황"` (자체 IR, 비상장 자회사 언급) |
 | `unknown_publisher_in_scope.pdf` | `"NewBoutique Research\n분석가 김신규\n삼성전자 [005930] 매수\n목표주가 100,000원"` |
-| `unknown_product_in_scope.pdf` | `"키움증권 분석\nABC텍 [123456] 매수\n주요제품: 완전이상한제품"` |
+| `unknown_product_in_scope.pdf` | `"키움증권 분석\n삼성전자 [005930] 매수\n주요제품: 완전이상한제품"` (KRX-matched stock so the unknown isolates products only — no unknown_stock_code noise) |
 | `private_unlisted.pdf` | `"비상장사 ABC 분석\n[000000]\n장외 시장 동향"` |
 
 ```python

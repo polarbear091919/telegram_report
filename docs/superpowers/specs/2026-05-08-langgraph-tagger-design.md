@@ -411,9 +411,19 @@ class KRXIndex:
         return self.by_code.get(code)
 
     def split_products(self, products_text: str) -> list[str]:
-        """ "MLCC, 기판, 카메라 모듈 등" → ['MLCC','기판','카메라 모듈'] """
-        tokens = [t.strip() for t in products_text.split(",")]
-        return [t for t in tokens if t and t != "등"]
+        """ "MLCC, 기판, 카메라 모듈 등" → ['MLCC','기판','카메라 모듈']
+            "DRAM, NAND 등"           → ['DRAM','NAND']
+        Trailing ' 등' 접미사도 제거 (KRX CSV에 흔한 형태).
+        """
+        out: list[str] = []
+        for token in products_text.split(","):
+            t = token.strip()
+            if t.endswith(" 등"):
+                t = t[:-2].strip()
+            if not t or t == "등":
+                continue
+            out.append(t)
+        return out
 
     def fuzzy_sector_match(self, value: str) -> Optional[str]:
         """alias 매핑 (예: '자동차'/'Auto'/'자동차산업' → 정규형). 도메인 외면 None."""
@@ -423,17 +433,11 @@ class KRXIndex:
         # 추가 alias 룰은 vocabulary/taxonomy.yaml에 보강 가능
         return None
 
-    def filter_products_by_membership(self, raw_products: list[str]) -> list[str]:
-        """
-        원 spec §3.d products 필터:
-        LLM이 뱉은 product 토큰이 KRX 어떤 row의 주요제품 셀에든 substring으로 등장해야 채택.
-        등장 안 하면 버림 (unknown_product 미발생, review_needed 아님).
-        """
-        out = []
-        for p in raw_products:
-            if any(p in e.products_text for e in self.by_code.values()):
-                out.append(p)
-        return out
+    # NOTE: filter_products_by_membership는 본 spec에서 더 이상 사용하지 않음.
+    # 원 spec §6.6 정책 보존을 위해 KRX 미매칭 product는 silent drop이 아니라
+    # validate 노드가 products_unknown으로 분리하고 decide_status가
+    # review_needed/low로 처리한다. helper가 필요하면 KRXIndex.has_product(p)
+    # 같은 단순 멤버십 체크로 충분 (또는 validate가 직접 by_code 순회).
 
     def rows_with_product(self, product_token: str) -> list[KRXEntry]:
         """주요제품 셀에 product_token이 substring으로 들어간 KRX 행."""
@@ -640,8 +644,11 @@ def canonicalize(state: RowState) -> dict:
     }
 ```
 
-publisher 룩업 실패는 review_needed 트리거 **아님** (원 spec §6.6) — `auto/medium + notes='unknown_publisher:<value>'`. decide_status에서 처리.
-topic 미매핑은 그대로 채택 (자유 어휘). confidence만 medium.
+publisher 룩업 실패(`publisher_canon=None`)는 decide_status에서 `review_needed/low + notes='unknown_publisher:<value>'`로 처리한다 (원 spec 2026-05-07 §6.6 정책 보존). canonicalize 노드 자체는 정책을 모르고 단순 룩업 결과만 반환한다.
+
+topic 미매핑은 그대로 채택 (자유 어휘). confidence만 medium으로 떨어지며 review_needed 아님.
+
+analysts는 vocabulary 매핑이 없다 (Option γ) — LLM이 추출한 raw 이름 그대로 `analysts text[]`에 적재한다.
 
 ### 8.6 `validate`
 
@@ -825,25 +832,29 @@ in-scope 경로의 row는 `enrich`가 채운 final 값 + `decide_status`가 정�
 from langgraph.graph import StateGraph, START, END
 from functools import partial
 
-def build_graph(client, sb, *, dry_run: bool):
+def build_graph(client, sb, *, krx, dry_run: bool, taxonomy_version: str):
     g = StateGraph(RowState)
     g.add_node("extract_pdf", extract_pdf)
     g.add_node("llm_extract", partial(llm_extract, client=client))
+    g.add_node("mark_oos_reason", mark_oos_reason)         # §8.3.1 — sets is_oos/oos_reason
     g.add_node("status_oos", status_oos)
-    g.add_node("status_unreadable", status_unreadable)  # pdf_unreadable / llm_refusal 처리
+    g.add_node("status_unreadable", status_unreadable)
     g.add_node("canonicalize", canonicalize)
-    g.add_node("validate", validate)
-    g.add_node("enrich", enrich)
+    g.add_node("validate", partial(validate, krx=krx))
+    g.add_node("enrich", partial(enrich, krx=krx))
     g.add_node("decide_status", decide_status)
-    g.add_node("write", partial(write, sb=sb, dry_run=dry_run))
+    g.add_node("write", partial(write, sb=sb, dry_run=dry_run, taxonomy_version=taxonomy_version))
 
     g.add_edge(START, "extract_pdf")
     g.add_edge("extract_pdf", "llm_extract")
-    g.add_conditional_edges("llm_extract", oos_gate, {
-        "status_oos": "status_oos",
+    # oos_gate는 routing-only — state mutation 없이 label만 반환.
+    # mark_oos_reason 별도 노드가 is_oos/oos_reason set 후 status_oos로 진입.
+    g.add_conditional_edges("llm_extract", partial(oos_gate, krx=krx), {
+        "mark_oos_reason":   "mark_oos_reason",
         "status_unreadable": "status_unreadable",
-        "canonicalize": "canonicalize",
+        "canonicalize":      "canonicalize",
     })
+    g.add_edge("mark_oos_reason", "status_oos")
     g.add_edge("status_oos", "write")
     g.add_edge("status_unreadable", "write")
     g.add_edge("canonicalize", "validate")
@@ -856,9 +867,13 @@ def build_graph(client, sb, *, dry_run: bool):
 
 ## 9. 운영
 
-### 9.1 Supabase 연동 (SQL)
+### 9.1 Supabase 연동 (SQL via asyncpg)
 
-`supabase_io.py`. master의 `SUPABASE_URL`/`SUPABASE_SERVICE_KEY` 환경변수 그대로 사용. 기존 `storage.py`(asyncpg + supabase-py)와 분리된 어댑터 1개 추가.
+`supabase_io.py`. **`SUPABASE_DB_URL` (직접 Postgres 연결 string)** 으로 `asyncpg` 풀을 만들어 raw SQL을 실행한다. supabase-py는 PostgREST 래퍼라서 `FOR UPDATE SKIP LOCKED` 같은 트랜잭션·락 SQL을 RPC 함수 등록 없이 실행하기 어렵다 — 본 spec은 SQL 투명성을 위해 asyncpg 직접 사용.
+
+기존 master의 `storage.py`(supabase-py 사용)와 분리된 어댑터 1개. master env (`SUPABASE_URL`/`SUPABASE_SERVICE_KEY`)는 collector가 계속 사용, tagger는 새 env `SUPABASE_DB_URL`만 읽음.
+
+asyncpg는 `$1, $2, ...` 위치 placeholder만 지원한다 (named placeholder 지원 안 함). 모든 SQL은 위치 인자로 작성.
 
 ```python
 # 핵심 SQL (원 spec §6.7과 일치)
@@ -907,29 +922,34 @@ UPDATE reports
 
 UPDATE_SQL = """
 UPDATE reports
-   SET published_at=$published_at,
-       report_type=$report_type,
-       publisher=$publisher,
-       publisher_type=$publisher_type,
-       analysts=$analysts,
-       title=$title,
-       stock_codes=$stock_codes,
-       company_names=$company_names,
-       sectors_major=$sectors_major,
-       sectors_minor=$sectors_minor,
-       products=$products,
-       topics=$topics,
-       out_of_scope_reason=$out_of_scope_reason,
-       tagging_status=$tagging_status,
-       tagging_confidence=$tagging_confidence,
-       tagging_notes=$tagging_notes,
+   SET published_at=$2,
+       report_type=$3,
+       publisher=$4,
+       publisher_type=$5,
+       analysts=$6,
+       title=$7,
+       stock_codes=$8,
+       company_names=$9,
+       sectors_major=$10,
+       sectors_minor=$11,
+       products=$12,
+       topics=$13,
+       out_of_scope_reason=$14,
+       tagging_status=$15,
+       tagging_confidence=$16,
+       tagging_notes=$17,
        tagging_locked_at=NULL,
        tagging_worker_id=NULL,
        tagged_at=now(),
        tagger_version='langgraph-tagger@1.0',
-       taxonomy_version=$taxonomy_version
- WHERE id=$id
+       taxonomy_version=$18
+ WHERE id=$1
 """
+# Bind args order: (id, published_at, report_type, publisher, publisher_type,
+#                   analysts, title, stock_codes, company_names,
+#                   sectors_major, sectors_minor, products, topics,
+#                   out_of_scope_reason, tagging_status, tagging_confidence,
+#                   tagging_notes, taxonomy_version)
 
 ESCALATION_PICK_SQL = """
 SELECT id FROM reports
