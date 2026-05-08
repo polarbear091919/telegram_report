@@ -1,4 +1,4 @@
-"""extract_pdf node: PyMuPDF reads page 1, falls back up to page 5 if metadata is sparse."""
+"""extract_pdf node: PyMuPDF reads page 1, falls back up to page 3 if metadata is sparse."""
 from __future__ import annotations
 
 import asyncio
@@ -63,6 +63,6 @@ def _sync_extract(path: Path, max_pages: int = 3) -> dict:
 
 
 async def extract_pdf(state: RowState) -> dict:
-    """Read PDF first page; fall back up to 5 pages if metadata is sparse."""
+    """Read PDF first page; fall back up to 3 pages if metadata is sparse."""
     path = _resolve(state["file_path"])
     return await asyncio.to_thread(_sync_extract, path)

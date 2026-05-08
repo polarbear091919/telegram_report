@@ -7,7 +7,7 @@ from pathlib import Path
 import fitz  # PyMuPDF
 import pytest
 
-from langgraph_tagger.nodes.extract_pdf import extract_pdf, _has_meta_signals
+from langgraph_tagger.nodes.extract_pdf import extract_pdf, _has_meta_signals, _sync_extract
 
 
 GOLDEN = Path(__file__).parent / "golden"
@@ -93,9 +93,6 @@ def test_meta_signals_detector():
 
 def test_extract_pdf_max_pages_is_3(monkeypatch, tmp_path):
     """v2: max_pages는 3 (기존 v1의 5에서 축소)."""
-    import fitz
-    from langgraph_tagger.nodes.extract_pdf import _sync_extract
-
     pdf = tmp_path / "five_pages.pdf"
     doc = fitz.open()
     for i in range(5):
