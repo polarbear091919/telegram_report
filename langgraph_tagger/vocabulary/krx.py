@@ -9,7 +9,6 @@ import csv
 import re
 from dataclasses import dataclass
 from datetime import datetime
-from functools import cache
 from pathlib import Path
 from typing import Optional
 

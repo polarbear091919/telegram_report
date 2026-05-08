@@ -7,11 +7,6 @@ import pytest
 from langgraph_tagger.vocabulary.krx import KRXIndex
 
 
-@pytest.fixture(scope="module")
-def krx() -> KRXIndex:
-    return KRXIndex.load(Path("docs/stock_data/KRX_stocks_data.csv"))
-
-
 class TestLoad:
     def test_csv_loads_with_normalized_header(self, krx):
         # Sanity: must load >= 2000 entries (KRX listed pool ~2,559)
