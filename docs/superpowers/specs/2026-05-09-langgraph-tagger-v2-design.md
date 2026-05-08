@@ -74,6 +74,7 @@ dry-run 결과 (3건 모두 review_needed/low):
 | **name/code mismatch** | n/a | **`confidence=medium` + `tagging_notes='krx_name_code_mismatch'`** (review까진 보내지 않음) |
 | **DB 컬럼** | (v1 그대로) | **+ stock_codes_raw, company_names_raw** (audit). **− topics** (drop) |
 | **GIN 인덱스** | stock_codes/company_names/... | **+ stock_codes_raw_gin, company_names_raw_gin** (audit 시나리오 G용) |
+| **기존 데이터 마이그레이션** | n/a | **모든 태깅 메타데이터 reset → pending** (14→6 매핑 안 함). PDF는 storage 보존, v2가 backfill로 재태깅 |
 
 ## 5. 핵심 결정
 
@@ -89,24 +90,25 @@ dry-run 결과 (3건 모두 review_needed/low):
 | 8 | KRX lookup은 report_type별 분기 (산업·전략·시황은 skip) | 산업·전략·시황은 회사 1개로 대표 불가. 매칭 강제하면 정상 리포트가 false review_needed로 폭증 |
 | 9 | OOS row의 report_type은 LLM 분류 그대로 유지 | 분포 분석 시 더 풍부 (단일종목+foreign 등). migration 003의 IR자료 처리(`report_type='IR자료'` 유지)와 일관 |
 | 10 | name/code mismatch는 review까지 안 보냄 | confidence=medium + notes로 신호. 명백한 오류는 audit raw 컬럼으로 추후 검토 가능. review_needed는 단일종목 KRX 미매칭으로만 트리거 |
+| 11 | 기존 v1 데이터는 14→6 매핑 대신 reset | v1 OOS는 `report_type='기타'` 강제로 풍부함이 이미 손실. 14→6 매핑(특히 ESG/부동산/파생/채권 → 산업)은 거친 변환이라 v2 재분류가 더 정확. 부분 마이그레이션의 정합성 복잡도(`publisher_type='company'` 잔존, IR row의 `tagging_status` 등)도 모두 사라짐. 비용은 ~$14 1회 |
 
 ## 6. 산출물
 
 1. **migration 003** `migrations/003_v2_redesign.sql`
    - **transaction 안에서 실행** (BEGIN/COMMIT) — 도중 실패 시 rollback
-   - 순서: ① 기존 CHECK 3개 DROP → ② 데이터 UPDATE (14→6 매핑, IR→ir_self) → ③ 컬럼 ADD/DROP → ④ 새 CHECK 3개 ADD → ⑤ GIN 인덱스 추가
+   - 순서: ① 기존 CHECK 3개 DROP → ② **모든 태깅 메타데이터 reset (UPDATE → NULL/'{}', tagging_status='pending')** → ③ 컬럼 ADD/DROP (raw 추가, topics DROP) → ④ 새 CHECK 3개 ADD → ⑤ raw GIN 인덱스 추가
    - report_type CHECK: 14종 → 6종
    - out_of_scope_reason CHECK: 4종 → 5종 (+ ir_self)
    - publisher_type CHECK: 5종 → 4종 (- company)
    - 신규 컬럼: `stock_codes_raw text[] NOT NULL DEFAULT '{}'`, `company_names_raw text[] NOT NULL DEFAULT '{}'`
    - 신규 GIN 인덱스: `ix_reports_stocks_raw_gin`, `ix_reports_companies_raw_gin` (audit 시나리오 G)
    - drop: `topics text[]` 컬럼 + `ix_reports_topics_gin` 인덱스
-   - 기존 row 마이그레이션 (§13)
+   - 기존 v1 데이터는 reset → v2 backfill로 재태깅 (§13)
 
 2. **vocabulary 변경**:
    - `publishers.yaml` — `해당기업` 항목의 `publisher_type_override: company` 라인 **제거** (other 섹션 안에 그대로 두면 자동으로 publisher_type='other'). LLM이 IR자료 발행 주체를 매칭할 수 있도록 항목 자체는 유지.
    - `topics.yaml` — **삭제**
-   - `taxonomy.yaml` — report_type 14→6, sector_major_aliases 유지
+   - `taxonomy.yaml` — report_type 14→6, oos 5종, publisher_type 4종, **`sector_major_aliases` 삭제** (KRX entry가 sector_major 답지를 직접 제공하므로 alias 매핑 불필요)
 
 3. **노드 변경**:
    - 삭제: `nodes/canonicalize.py`, `nodes/validate.py`, `nodes/enrich.py`
@@ -154,8 +156,9 @@ v1 vs v2 노드 흐름 차이:
 - v1 in-scope: `canonicalize → validate → enrich → decide_status → write` (4 노드)
 - v2 in-scope: `resolve_krx → decide_status → write` (2 노드)
 
-`resolve_krx`가 publisher canonicalization·sector enrich·product 회수를 모두 흡수.
+`resolve_krx`가 sector enrich·product 회수·종목명 정규화를 모두 흡수.
 `published_at` 폴백은 `resolve_krx` 안에서 처리.
+publisher canonicalization은 v2에서 LLM이 직접 출력 (별도 노드 불필요).
 
 ## 8. 데이터 모델
 
@@ -419,11 +422,25 @@ def mark_oos_reason(state) -> dict:
     return {"is_oos": True, "oos_reason": "private"}
 ```
 
-### 9.6 `status_oos` (그대로)
+### 9.6 `status_oos` (변경 — `ir_self` high 추가)
+
+v1 코드는 `confidence = "high" if reason in ("foreign","fund","digital") else "medium"`이라 새 reason `ir_self`가 medium으로 떨어짐. v2에서 high로 추가:
+
+```python
+def status_oos(state: RowState) -> dict:
+    reason = state["oos_reason"]
+    confidence = "high" if reason in ("foreign","fund","digital","ir_self") else "medium"
+    return {
+        "is_oos": True,
+        "tagging_status": "auto",
+        "tagging_confidence": confidence,
+        "tagging_notes": None,
+    }
+```
 
 `is_oos=True`, `tagging_status='auto'`, confidence:
 - foreign/fund/digital/ir_self: `high`
-- private: `medium` (보더라인)
+- private: `medium` (보더라인 — 비상장 판단이 LLM heuristic에 의존)
 
 ### 9.7 `status_unreadable` (그대로)
 
@@ -447,7 +464,7 @@ def resolve_krx(state, *, krx) -> dict:
 
     # ── 산업 / 전략·시황: KRX lookup 자체를 skip ──────────────────────
     if rt in ("산업", "전략·시황"):
-        return _finalize(state, raw, entries=[], skipped=True, mismatch=False)
+        return _finalize(state, raw, krx=krx, entries=[], skipped=True, mismatch=False)
 
     # ── 단일종목 / 섹터 / 기타: KRX 시도 ─────────────────────────────
     entries: list[KRXEntry] = []
@@ -491,10 +508,10 @@ def resolve_krx(state, *, krx) -> dict:
         norm_raws  = ["".join(n.split()).lower() for n in raw.company_names_raw]
         mismatch = norm_entry not in norm_raws
 
-    return _finalize(state, raw, entries=entries, skipped=False, mismatch=mismatch)
+    return _finalize(state, raw, krx=krx, entries=entries, skipped=False, mismatch=mismatch)
 
 
-def _finalize(state, raw, *, entries, skipped, mismatch) -> dict:
+def _finalize(state, raw, *, krx, entries, skipped, mismatch) -> dict:
     """entries → final 컬럼 + published_at fallback. lookup 결과를 직렬화한다."""
     if entries:
         sm = []
@@ -732,7 +749,13 @@ review_reasons = {first_page_unreadable, llm_refusal, type_indeterminate, krx_un
 
 ## 11. migration 003
 
-핵심: 기존 CHECK 제약이 `'전략·시황'`, `'ir_self'`를 포함하지 않으므로 **데이터 UPDATE 전에 DROP CONSTRAINT 먼저**. 전체를 단일 transaction으로 wrap해서 도중 실패 시 rollback.
+**전략 변경**: 기존 v1으로 태깅된 데이터(auto=3,317, review_needed=73, oos_total=151)를 14→6 매핑으로 부분 변환하지 않고 **모두 비우고 `pending`으로 reset**한다. v2가 backfill 모드로 다시 태깅한다.
+
+**근거**:
+- v1 OOS row는 `report_type='기타'` 강제로 저장됐으므로 OOS 분포 풍부함이 이미 손실됨
+- 14→6 매핑(특히 ESG/부동산/파생/채권 → 산업)은 거친 변환이라 v2가 새로 분류하는 게 더 정확
+- 기존 `publisher_type='company'` 잔존 처리, IR row의 `tagging_status` 정합성 등 부분 마이그레이션 복잡도가 모두 사라짐
+- PDF 파일은 storage에 그대로 보존 — reset되는 것은 DB의 태깅 메타데이터만
 
 ```sql
 -- migrations/003_v2_redesign.sql
@@ -740,36 +763,41 @@ review_reasons = {first_page_unreadable, llm_refusal, type_indeterminate, krx_un
 BEGIN;
 
 -- ============================================================
--- 1. 기존 CHECK 제약 DROP (UPDATE에서 새 enum value를 쓸 수 있도록)
+-- 1. 기존 CHECK 제약 DROP (reset에서 NULL 허용에 필요)
 -- ============================================================
 ALTER TABLE reports DROP CONSTRAINT IF EXISTS chk_report_type;
 ALTER TABLE reports DROP CONSTRAINT IF EXISTS chk_out_of_scope_reason;
 ALTER TABLE reports DROP CONSTRAINT IF EXISTS chk_publisher_type;
 
 -- ============================================================
--- 2. 기존 데이터 마이그레이션 (14종 → 6종 매핑)
---    그대로 유지하는 5종 (단일종목/산업/섹터/IR자료/기타)은 손대지 않음.
+-- 2. 모든 태깅 메타데이터를 비우고 pending 상태로 reset
+--    PDF 파일/메시지 메타(file_path, sent_at, caption 등)는 그대로 보존.
 -- ============================================================
-UPDATE reports SET report_type = '전략·시황'
- WHERE report_type IN ('시황·데일리','거시·매크로','퀀트·전략','전략·테마');
-
-UPDATE reports SET report_type = '단일종목'
- WHERE report_type = 'IPO';   -- IPO 분석은 한 종목 분석 본질. KRX 미매칭이면 review_needed로 빠짐.
-
-UPDATE reports SET report_type = '산업'
- WHERE report_type IN ('ESG','부동산·리츠','파생·원자재','채권·크레딧');
-
--- 3. IR자료 데이터를 OOS ir_self로 이전
---    publisher_type='company'를 'other'로 정리 (CHECK가 4종으로 줄어들기 때문)
---    report_type='IR자료'은 그대로 유지 — A=α 결정 (LLM 분류 그대로 보존)
-UPDATE reports
-   SET out_of_scope_reason = 'ir_self',
-       publisher_type      = 'other',
-       publisher           = COALESCE(publisher, '해당기업')
- WHERE report_type = 'IR자료';
+UPDATE reports SET
+    published_at        = NULL,
+    report_type         = NULL,
+    publisher           = NULL,
+    publisher_type      = NULL,
+    analysts            = '{}',
+    title               = NULL,
+    stock_codes         = '{}',
+    company_names       = '{}',
+    sectors_major       = '{}',
+    sectors_minor       = '{}',
+    products            = '{}',
+    -- topics는 step 3에서 DROP COLUMN
+    out_of_scope_reason = NULL,
+    tagging_status      = 'pending',
+    tagging_locked_at   = NULL,
+    tagging_worker_id   = NULL,
+    tagger_version      = NULL,
+    taxonomy_version    = NULL,
+    tagging_confidence  = NULL,
+    tagging_notes       = NULL,
+    tagged_at           = NULL;
 
 -- ============================================================
--- 4. 컬럼 ADD/DROP
+-- 3. 컬럼 ADD/DROP
 -- ============================================================
 ALTER TABLE reports
   ADD COLUMN IF NOT EXISTS stock_codes_raw   text[] NOT NULL DEFAULT '{}',
@@ -779,7 +807,7 @@ DROP INDEX IF EXISTS ix_reports_topics_gin;
 ALTER TABLE reports DROP COLUMN IF EXISTS topics;
 
 -- ============================================================
--- 5. 새 CHECK 제약 ADD
+-- 4. 새 CHECK 제약 ADD (v2 enum)
 -- ============================================================
 ALTER TABLE reports ADD CONSTRAINT chk_report_type CHECK (
   report_type IS NULL OR report_type IN
@@ -797,7 +825,7 @@ ALTER TABLE reports ADD CONSTRAINT chk_publisher_type CHECK (
 );
 
 -- ============================================================
--- 6. audit raw 컬럼 GIN 인덱스 (시나리오 G — KRX 미매칭 분석)
+-- 5. audit raw 컬럼 GIN 인덱스 (시나리오 G — KRX 미매칭 분석)
 -- ============================================================
 CREATE INDEX IF NOT EXISTS ix_reports_stocks_raw_gin
   ON reports USING gin (stock_codes_raw);
@@ -807,22 +835,11 @@ CREATE INDEX IF NOT EXISTS ix_reports_companies_raw_gin
 COMMIT;
 ```
 
-**적용 전 분포 확인** (B=α 결정대로 14→6 매핑은 진행하되 분포는 사전 확인 권장):
-
-```sql
--- 14종 매핑 영향 범위 확인
-SELECT report_type, count(*) FROM reports
- WHERE report_type IN ('시황·데일리','거시·매크로','퀀트·전략','전략·테마',
-                       'IPO','ESG','부동산·리츠','파생·원자재','채권·크레딧')
- GROUP BY report_type ORDER BY count(*) DESC;
-
--- IR자료 → OOS ir_self 영향 범위
-SELECT count(*) FROM reports WHERE report_type = 'IR자료';
-
--- 기존 CHECK 제약 안에 'company' publisher_type이 얼마나 있는지
-SELECT publisher_type, count(*) FROM reports
- WHERE publisher_type = 'company' GROUP BY publisher_type;
-```
+**reset 후 상태**:
+- 모든 row가 `tagging_status='pending'`, 모든 분류 컬럼 NULL/빈 배열
+- 신규 `stock_codes_raw`, `company_names_raw`는 default `'{}'` (비어있음)
+- `idx_reports_untagged` (001_init.sql, `where tagged_at is null`)이 다시 모든 row를 가리킴
+- v2 backfill: `python -m langgraph_tagger run --backfill-days <전체 기간>` 또는 평소 `pending` 큐 처리
 
 ## 12. 활용 시나리오 (변경)
 
@@ -836,28 +853,38 @@ SELECT publisher_type, count(*) FROM reports
 | E | 제목 키워드 | 그대로 |
 | F | 비-종목 토픽 | **폐기** — topics 컬럼 자체 없음. 운영 필요 시 title ILIKE으로 대체 |
 | G (신규) | KRX 미매칭 분석 (audit) | `tagging_notes LIKE 'krx_unmatched_in_scope%'` 또는 `tagging_notes='krx_name_code_mismatch'`인 row의 `stock_codes_raw`/`company_names_raw` 검토 |
-| H (신규) | OOS IR자료 분포 | `out_of_scope_reason='ir_self'` (report_type='IR자료'와 일관) |
-| I (신규) | OOS 분포의 type별 분석 | `report_type` × `out_of_scope_reason` 교차 (예: 단일종목+foreign 비중) — OOS row의 report_type을 강제 변환 안 했기 때문에 가능 |
+| H (신규) | OOS IR자료 분포 | `out_of_scope_reason='ir_self'` (report_type='IR자료'와 일관) — v2 재태깅 후 모든 row가 v2 정책으로 통일됨 |
+| I (신규) | OOS 분포의 type별 분석 | `report_type` × `out_of_scope_reason` 교차 (예: 단일종목+foreign 비중) — v2가 OOS row의 report_type을 강제 변환 안 함 + reset으로 v1 흔적 제거 |
 
-## 13. 기존 row 처리 (마이그레이션)
+## 13. 기존 row 처리 (reset → v2 재태깅)
 
-inspect 결과: `auto=3,317`, `review_needed=73`, `oos_total=151`. 이 데이터는 v1 14종으로 분류됨.
+inspect 결과: `auto=3,317`, `review_needed=73`, `oos_total=151`. 모두 v1 코드로 태깅된 데이터.
 
-migration 003의 step 2·3이 자동으로 처리:
-- step 2: 14종 → 6종 매핑 (시황·데일리/거시·매크로/퀀트·전략/전략·테마 → 전략·시황, IPO → 단일종목, ESG/부동산·리츠/파생·원자재/채권·크레딧 → 산업)
-- step 3: IR자료 row → `out_of_scope_reason='ir_self'`, `publisher_type='other'`, `publisher` null이면 '해당기업'. **`report_type='IR자료'`은 그대로 유지** (A=α 결정).
+**전략**: migration 003 step 2가 모든 태깅 메타데이터를 비우고 `tagging_status='pending'`으로 reset. PDF 파일은 storage에 그대로 보존되어 v2가 모두 재태깅한다.
 
-기존 `topics` 데이터는 컬럼과 함께 폐기. 운영자가 백업이 필요하면 migration 전에 export 권장.
+| 영역 | reset 후 상태 |
+|---|---|
+| `published_at`, `report_type`, `publisher`, `publisher_type`, `title`, `out_of_scope_reason`, `tagging_*`, `tagger_version`, `taxonomy_version`, `tagged_at` | NULL |
+| `analysts`, `stock_codes`, `company_names`, `sectors_major`, `sectors_minor`, `products` | `'{}'` (빈 배열) |
+| `topics` | 컬럼 자체 DROP |
+| `stock_codes_raw`, `company_names_raw` | default `'{}'` |
+| `tagging_status` | `'pending'` |
+| 보존 | `id`, `message_id`, `chat_username`, `sent_at`, `downloaded_at`, `file_*`, `caption`, `tags` (PDF/메시지 메타) |
 
-기존 `stock_codes`/`company_names`는 그대로 남음. v1에서는 v2의 `stock_codes_final`에 해당. v2 신규 row만 `stock_codes_raw`/`company_names_raw`가 채워짐 (기존 row는 audit 비어있음).
+**v2 재태깅 트리거**: 전체가 `pending`이므로 평소 `python -m langgraph_tagger run --batch-size N`을 반복하거나, `--backfill-days <전체 기간>`으로 한 번에 처리. v1 backfill로 다운로드된 PDF는 모두 storage에 있으므로 추가 다운로드는 발생하지 않음.
 
-기존 OOS row (151건)의 `report_type`은 LLM이 v1에서 분류한 14종 그대로 — migration step 2의 매핑으로 6종에 정렬됨. v2의 OOS write 정책도 `report_type`을 LLM 분류 그대로 보존하므로, 신규/기존 OOS row의 schema가 일관됨.
+**비용 추정** (gpt-5.4-mini, ~3,541건): v1 dry-run 기준 row당 약 0.4¢ × 3,541 ≈ $14 — backfill 시 한 번 발생.
+
+**손실되는 정보** (v1 데이터에서):
+- v1의 14종 분류는 v2의 6종으로 새로 분류됨 (운영 분석상 더 정확)
+- v1의 `topics` 데이터는 컬럼과 함께 영구 폐기 (사용자 결정 — 결과물 활용도 낮음). 백업 필요 시 migration 전 export 권장
+- v1의 OOS row는 `report_type='기타'` 강제 저장이라 LLM 원분류는 이미 손실 상태였음 — reset은 추가 손실 없음
 
 ## 14. v1 commit 매핑 (incremental rev-5)
 
 | v1 영역 | v2 변경 |
 |---|---|
-| Task 1 (migration 002 + KRX CSV) | migration 003 추가: BEGIN/COMMIT transaction wrap, DROP CONSTRAINT 먼저, 14→6 매핑 + IR→ir_self UPDATE, 컬럼 ADD/DROP, 새 CHECK ADD, raw GIN 인덱스 2개 |
+| Task 1 (migration 002 + KRX CSV) | migration 003 추가: BEGIN/COMMIT transaction wrap, DROP CONSTRAINT 먼저, **모든 태깅 메타데이터 reset (UPDATE → NULL/'{}', tagging_status='pending')**, 컬럼 ADD/DROP (raw 추가, topics DROP), 새 CHECK ADD, raw GIN 인덱스 2개 |
 | Task 2 (package skeleton) | 그대로 |
 | Task 3 (taxonomy/publishers/topics YAML) | topics.yaml **삭제**, taxonomy.yaml report_types 6종/oos 5종/publisher_type 4종, **publishers.yaml의 `해당기업: publisher_type_override: company` 라인 제거** |
 | Task 4 (vocabulary __init__) | `lookup_publisher`/`map_topics` 삭제. `taxonomy()` 유지 |
@@ -867,7 +894,7 @@ migration 003의 step 2·3이 자동으로 처리:
 | Task 8 (extract_pdf) | max_pages=3 |
 | Task 9 (llm_extract) | 그대로 (호출만, schema는 새 LLMExtraction) |
 | Task 10 (oos_gate + mark_oos_reason) | 둘 다 룰 변경 (IR자료 분기 + ir_self) |
-| Task 11 (status_oos + status_unreadable) | 그대로. confidence: foreign/fund/digital/ir_self=high, private=medium |
+| Task 11 (status_oos + status_unreadable) | **status_oos 변경**: high tier에 `ir_self` 추가 (foreign/fund/digital/ir_self → high, private → medium). status_unreadable은 그대로 |
 | Task 12 (canonicalize) | **삭제** |
 | Task 13 (validate) | **삭제** |
 | Task 14 (enrich) | **삭제 + resolve_krx 신규** — report_type별 분기 (단일종목 1 / 섹터 N / 산업·전략·시황 skip / 기타 1) + name_code_mismatch 감지 + entries union |
