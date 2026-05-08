@@ -1,0 +1,37 @@
+# Source-of-truth enums for langgraph_tagger.
+# Mirrors migrations/002_tagging_columns.sql CHECK constraints
+# and the 14-type taxonomy from friendly-mclaren skill.
+report_types:
+  - 단일종목
+  - 산업
+  - 섹터
+  - 시황·데일리
+  - 거시·매크로
+  - 퀀트·전략
+  - 전략·테마
+  - IPO
+  - ESG
+  - 부동산·리츠
+  - 파생·원자재
+  - 채권·크레딧
+  - IR자료
+  - 기타
+
+oos_reasons: [foreign, fund, digital, private]
+publisher_types: [broker, company, data_provider, ir_agency, other]
+tagging_statuses: [pending, processing, auto, review_needed, verified]
+tagging_confidences: [high, medium, low]
+
+# Sector-major canonical with alias rules
+# (KRX CSV is the authoritative source; this list is for fuzzy match only.)
+sector_major_aliases:
+  Auto: ["자동차", "자동차산업", "Automotive"]
+
+# Reference-only: precedence rules (codes implement these in oos_gate / decide_status)
+precedence_rules:
+  - "OOS patterns override all other classification (Rule 1)"
+  - "Asset class beats filename prefix: 산업_부동산_ → 부동산·리츠 etc. (Rule 2)"
+  - "Listed-company IPO update is 단일종목, not IPO (Rule 3)"
+  - "IPO vs OOS private: KRX-matched code → in-scope (Rule 4)"
+  - "publisher_type=company (self IR) is in-scope IR자료 even if unlisted (Rule 4)"
+  - "Ambiguous prefix → header keywords; else type_indeterminate (Rule 5)"
