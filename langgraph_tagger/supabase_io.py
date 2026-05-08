@@ -115,7 +115,17 @@ class SupabaseSQL:
         url = os.environ.get("SUPABASE_DB_URL")
         if not url:
             raise RuntimeError("SUPABASE_DB_URL is required")
-        pool = await asyncpg.create_pool(url, min_size=1, max_size=10)
+        # statement_cache_size=0 is required when SUPABASE_DB_URL points at
+        # Supabase's transaction pooler (port 6543), since pgbouncer in
+        # transaction mode does not preserve named prepared statements
+        # across pooled connections. Direct connections (port 5432) tolerate
+        # caching but disabling is harmless.
+        pool = await asyncpg.create_pool(
+            url,
+            min_size=1,
+            max_size=10,
+            statement_cache_size=0,
+        )
         return cls(pool)
 
     async def close(self) -> None:
