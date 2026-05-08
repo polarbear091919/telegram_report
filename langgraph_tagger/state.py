@@ -5,12 +5,11 @@ TypedDict with all keys total=False — each node sets only the keys it owns.
 from __future__ import annotations
 
 from datetime import date, datetime
-from typing import Optional, TYPE_CHECKING
+from typing import Optional
 
 from typing_extensions import Literal, TypedDict
 
-if TYPE_CHECKING:
-    from langgraph_tagger.llm_schemas import LLMExtraction
+from langgraph_tagger.llm_schemas import LLMExtraction
 
 
 class RowState(TypedDict, total=False):
@@ -30,7 +29,7 @@ class RowState(TypedDict, total=False):
     pdf_unreadable: bool
 
     # llm_extract output
-    llm_raw: Optional["LLMExtraction"]
+    llm_raw: Optional[LLMExtraction]
     llm_refusal: Optional[str]
 
     # oos_gate output
