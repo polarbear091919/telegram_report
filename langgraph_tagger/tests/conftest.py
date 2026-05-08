@@ -56,19 +56,16 @@ def mock_openai_client():
 
 
 def make_llm_extraction(**overrides) -> LLMExtraction:
-    """Factory for tests — sane defaults overridable per test."""
+    """Factory for tests — v2 sane defaults overridable per test."""
     defaults = dict(
         report_type="단일종목",
         title="삼성전자 1Q26 Preview",
         published_at="2026-05-01",
         stock_codes_raw=["005930"],
-        company_names=["삼성전자"],
-        sectors_major=["반도체"],
-        sectors_minor=["메모리반도체"],
-        products=["DRAM", "NAND"],
-        publisher_raw="키움증권",
+        company_names_raw=["삼성전자"],
+        publisher_canon="키움증권",
+        publisher_type="broker",
         analysts=["홍길동"],
-        topics=["AI수혜"],
         oos_signals=OOSSignals(
             foreign_primary_coverage=False, etf_or_fund=False,
             digital_asset=False, private_company_likely=False,

@@ -1,6 +1,10 @@
-"""LangGraph row-graph state.
+"""LangGraph row-graph state (v2).
 
 TypedDict with all keys total=False — each node sets only the keys it owns.
+v2 변경 (rev-7):
+- canonicalize/validate 단계 키 제거 (해당 노드 삭제)
+- enrich 출력 → resolve_krx로 통합 + krx_lookup_skipped/krx_entries/krx_name_code_mismatch 추가
+- oos_reason Literal에 ir_self 추가
 """
 from __future__ import annotations
 
@@ -10,6 +14,7 @@ from typing import Optional
 from typing_extensions import Literal, TypedDict
 
 from langgraph_tagger.llm_schemas import LLMExtraction
+from langgraph_tagger.vocabulary.krx import KRXEntry
 
 
 class RowState(TypedDict, total=False):
@@ -32,26 +37,16 @@ class RowState(TypedDict, total=False):
     llm_raw: Optional[LLMExtraction]
     llm_refusal: Optional[str]
 
-    # oos_gate output
+    # oos_gate / mark_oos_reason output
     is_oos: bool
-    oos_reason: Optional[Literal["foreign", "fund", "digital", "private"]]
+    oos_reason: Optional[Literal["foreign", "fund", "digital", "private", "ir_self"]]
 
-    # canonicalize output
-    publisher_canon: Optional[str]
-    publisher_type: Optional[Literal["broker", "company", "data_provider", "ir_agency", "other"]]
-    topics_canon: list[str]
-    topic_unmapped: list[str]
-
-    # validate output
-    stock_codes_valid: list[str]
-    stock_codes_unknown: list[str]
-    sectors_major_valid: list[str]
-    sectors_minor_valid: list[str]
-    sectors_unknown: list[str]
-    products_valid: list[str]
-    products_unknown: list[str]
-
-    # enrich output
+    # resolve_krx output (v1 canonicalize+validate+enrich 통합)
+    krx_lookup_skipped: bool       # 산업/전략·시황은 True
+    krx_matched: bool              # 매칭 entry가 1개 이상 존재
+    krx_entries: list[KRXEntry]    # 단일종목=0~1, 섹터=0~N, 산업/전략·시황=[]
+    krx_name_code_mismatch: bool   # 단일종목 + stock_code 매칭이지만 entry.name이 raw에 없음
+    stock_codes_final: list[str]
     company_names_final: list[str]
     sectors_major_final: list[str]
     sectors_minor_final: list[str]
