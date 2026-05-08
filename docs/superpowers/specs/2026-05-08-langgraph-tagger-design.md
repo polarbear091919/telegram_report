@@ -655,28 +655,28 @@ analysts는 vocabulary 매핑이 없다 (Option γ) — LLM이 추출한 raw 이
 ### 8.6 `validate`
 
 ```python
-def validate(state: RowState) -> dict:
+def validate(state: RowState, *, krx: KRXIndex) -> dict:
     raw = state["llm_raw"]
     valid_codes, unknown_codes = [], []
     for c in raw.stock_codes_raw:
         if not re.fullmatch(r"[0-9A-Z]{6}", c):
             unknown_codes.append(c); continue
-        (valid_codes if KRX.validate_code(c) else unknown_codes).append(c)
+        (valid_codes if krx.validate_code(c) else unknown_codes).append(c)
 
     smajor_valid, sminor_valid, s_unknown = [], [], []
     for s in raw.sectors_major:
-        m = KRX.fuzzy_sector_match(s)
-        if m and m in KRX.sectors_major: smajor_valid.append(m)
+        m = krx.fuzzy_sector_match(s)
+        if m and m in krx.sectors_major: smajor_valid.append(m)
         else:                            s_unknown.append(s)
     for s in raw.sectors_minor:
-        m = KRX.fuzzy_sector_match(s)
-        if m and m in KRX.sectors_minor: sminor_valid.append(m)
+        m = krx.fuzzy_sector_match(s)
+        if m and m in krx.sectors_minor: sminor_valid.append(m)
         else:                            s_unknown.append(s)
 
     # products: KRX substring 멤버십 검증 (원 spec §6.6 정책 — silent drop 안 함)
     products_valid, products_unknown = [], []
     for p in raw.products:
-        if KRX.has_product(p):
+        if krx.has_product(p):
             products_valid.append(p)
         else:
             products_unknown.append(p)
@@ -692,12 +692,14 @@ def validate(state: RowState) -> dict:
     }
 ```
 
+graph assembly에서 `partial(validate, krx=krx)`로 KRX 인덱스를 주입한다. 노드 내부에서 전역 `KRX` 모듈 변수를 직접 참조하지 않으므로 단위 테스트에서 mock KRX 주입이 가능하고 import 순서에 의존하지 않는다.
+
 `unknown_codes`/`sectors_unknown`/`products_unknown`이 비지 않았는데 OOS 패턴도 아니면 decide_status에서 `review_needed/low` 트리거 (원 spec §6.6 정책).
 
 ### 8.7 `enrich`
 
 ```python
-def enrich(state: RowState) -> dict:
+def enrich(state: RowState, *, krx: KRXIndex) -> dict:
     raw = state["llm_raw"]
     company_names = list(raw.company_names)
     sectors_major = list(state["sectors_major_valid"])
@@ -707,26 +709,26 @@ def enrich(state: RowState) -> dict:
     # 단일종목/IR/IPO + KRX 매칭 → 자동 보강
     if raw.report_type in ("단일종목","IR자료","IPO"):
         for code in state["stock_codes_valid"]:
-            entry = KRX.lookup(code)
+            entry = krx.lookup(code)
             if not entry: continue
             if entry.name not in company_names: company_names.append(entry.name)
             if entry.sector_major and entry.sector_major not in sectors_major:
                 sectors_major.append(entry.sector_major)
             if entry.sector_minor and entry.sector_minor not in sectors_minor:
                 sectors_minor.append(entry.sector_minor)
-            for tok in KRX.split_products(entry.products_text):
+            for tok in krx.split_products(entry.products_text):
                 if tok not in products: products.append(tok)
 
     # 산업 깊이 합류: products → minor/major, minor → major (원 spec §6.3)
     # validate가 이미 substring 멤버십 검증함. 여기서 다시 필터링 안 함.
     for p in products:
-        for entry in KRX.rows_with_product(p):
+        for entry in krx.rows_with_product(p):
             if entry.sector_minor and entry.sector_minor not in sectors_minor:
                 sectors_minor.append(entry.sector_minor)
             if entry.sector_major and entry.sector_major not in sectors_major:
                 sectors_major.append(entry.sector_major)
     for sm in list(sectors_minor):
-        for entry in KRX.rows_with_sector_minor(sm):
+        for entry in krx.rows_with_sector_minor(sm):
             if entry.sector_major and entry.sector_major not in sectors_major:
                 sectors_major.append(entry.sector_major)
 
@@ -747,6 +749,8 @@ def enrich(state: RowState) -> dict:
         "used_sent_at_fallback": used_fallback,
     }
 ```
+
+graph assembly에서 `partial(enrich, krx=krx)`로 주입. validate와 같은 패턴.
 
 products 필터링 (원 spec §3.d/§6.6): LLM이 뱉은 product 토큰이 KRX CSV의 어떤 row의 `주요제품` 셀에든 substring으로 등장해야 `products_valid`에 채택. 등장 안 하면 `products_unknown`에 들어가 decide_status가 `review_needed/low/notes='unknown_product:<value>'`로 처리. silent drop 안 함 — 원 spec §6.6 정책 보존.
 
@@ -1087,7 +1091,7 @@ HEARTBEAT_ENABLED=false
 | PyMuPDF (sync) | `asyncio.to_thread`로 wrapping. 이벤트 루프 안 막음. |
 | **per-row deadline** | `PER_ROW_DEADLINE_S` (기본 90초). 초과 시 row를 pending으로 되돌림. PDF 손상·OpenAI 행거·extract 무한루프 방지. |
 | **lock TTL** | `LOCK_TTL_MINUTES` (기본 30분). `tagging_locked_at < now() - LOCK_TTL_MINUTES`인 `processing` row를 stale로 보고 회수. **`LOCK_TTL_MINUTES * 60 > PER_ROW_DEADLINE_S`** 보장 (그 사이 정상 처리가 끝날 시간을 줘야 stale 회수가 살아있는 워커를 방해하지 않음). |
-| **heartbeat (선택)** | `HEARTBEAT_ENABLED=true`이면 워커가 처리 중 `tagging_locked_at = now()`를 `HEARTBEAT_INTERVAL_S`마다 갱신. PDF가 매우 큰 경우 (`PER_ROW_DEADLINE_S`를 길게 잡아야 할 때) lock TTL 안 늘리면서 stale 오작동 방지. 일상 batch에는 불필요. |
+| **heartbeat (v1 reserved, 미구현)** | env `HEARTBEAT_ENABLED` / `HEARTBEAT_INTERVAL_S`는 forward-compat 용으로만 정의됨. v1 orchestrator는 이 값을 **읽지 않는다** — `HEARTBEAT_ENABLED=true`로 설정해도 동작 안 함. 사용 시기: PDF가 매우 커서 `PER_ROW_DEADLINE_S`를 늘려야 할 때 lock TTL을 늘리지 않고 stale 오작동을 막는 v2 기능. 운영 안전 제약 `LOCK_TTL_MINUTES * 60 > PER_ROW_DEADLINE_S`만 지키면 v1에서는 불필요. |
 
 기본 `MAX_CONCURRENT_LLM=10`. 실패율·지연 보면서 조정.
 
