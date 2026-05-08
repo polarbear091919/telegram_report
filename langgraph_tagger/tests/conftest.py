@@ -78,3 +78,30 @@ def make_llm_extraction(**overrides) -> LLMExtraction:
     )
     defaults.update(overrides)
     return LLMExtraction(**defaults)
+
+
+@pytest.fixture
+def mock_supabase():
+    """In-memory mock for SupabaseSQL: records UPDATE/REVERT calls, replays SELECT."""
+    class MockSupabase:
+        def __init__(self):
+            self.executed: list[tuple[str, tuple]] = []
+            self.fetched: list[tuple[str, tuple]] = []
+            self._fetch_responses: list[list[dict]] = []
+
+        def queue_fetch(self, rows: list[dict]):
+            self._fetch_responses.append(rows)
+
+        async def fetch(self, sql, args=()):
+            self.fetched.append((sql, tuple(args)))
+            if self._fetch_responses:
+                return self._fetch_responses.pop(0)
+            return []
+
+        async def execute(self, sql, args=()):
+            self.executed.append((sql, tuple(args)))
+
+        async def close(self):
+            pass
+
+    return MockSupabase()
