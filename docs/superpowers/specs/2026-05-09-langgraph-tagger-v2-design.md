@@ -62,14 +62,18 @@ dry-run 결과 (3건 모두 review_needed/low):
 | **sectors/products** | LLM 추출 + KRX 검증 + 산업 합류 enrich | **LLM 추출 안 함. KRX entry에서 직접 가져옴** |
 | **topics** | LLM 추출 + topics.yaml 매핑 | **폐기** |
 | **OOS reason 종류** | 4종 (foreign/fund/digital/private) | **5종** (+ ir_self) |
-| **IR자료 처리** | in-scope (publisher_type='company') | **OOS ir_self** |
+| **IR자료 처리** | in-scope (publisher_type='company') | **OOS ir_self** (`report_type='IR자료'` 유지) |
+| **OOS row의 report_type** | n/a (대부분 in-scope 분류) | **LLM 분류 그대로 유지** (예: 단일종목+foreign, IR자료+ir_self). `'기타'` 강제 안 함 |
 | **종목명 정규화** | LLM raw 그대로 | **KRX 매칭 시 KRX 종목명 overwrite + raw audit** |
 | **canonicalize 노드** | publisher 룩업 + topic alias | **삭제** (publisher는 LLM, topic은 폐기) |
 | **validate 노드** | KRX code/sector/product 검증 | **resolve_krx로 통합** |
 | **enrich 노드** | KRX 산업 합류 + published_at fallback | **resolve_krx로 통합 + published_at fallback 분리** |
-| **resolve_krx 노드** | (없음) | **신규** — stock_code 우선 + name fuzzy로 KRX entry 결정, sectors/products 답지 회수 |
-| **decide_status 정책** | unknown_publisher/product/sector → review_needed/low | **krx_unmatched_in_scope만 review_needed/low** (vocab 검증 자체가 사라짐) |
+| **resolve_krx 노드** | (없음) | **신규** — type별 정책: 단일종목 1 entry / 섹터 N entry aggregate / 산업·전략·시황 skip |
+| **KRX lookup 정책** | 전 in-scope에 시도 (validate→enrich) | **report_type별 분기**: 단일종목 1개 / 섹터 N개 union / 산업·전략·시황 skip / 기타 1개 시도 |
+| **decide_status 정책** | unknown_publisher/product/sector → review_needed/low | **`report_type='단일종목'` + `krx_unmatched_in_scope`만** review_needed/low. 산업·전략·시황은 KRX 없이도 auto |
+| **name/code mismatch** | n/a | **`confidence=medium` + `tagging_notes='krx_name_code_mismatch'`** (review까진 보내지 않음) |
 | **DB 컬럼** | (v1 그대로) | **+ stock_codes_raw, company_names_raw** (audit). **− topics** (drop) |
+| **GIN 인덱스** | stock_codes/company_names/... | **+ stock_codes_raw_gin, company_names_raw_gin** (audit 시나리오 G용) |
 
 ## 5. 핵심 결정
 
@@ -80,21 +84,27 @@ dry-run 결과 (3건 모두 review_needed/low):
 | 3 | KRX 단일 진실 공급원 | 사용자 #3 명시. LLM이 sectors/products를 PDF에서 정확히 KRX 도메인 형식으로 추출 못함 (영문/한글, 약어/풀네임 mismatch) |
 | 4 | topics 폐기 | dry-run에서 LLM이 출력한 topics가 모두 ad-hoc 자유 텍스트 — vocab 매핑이 거의 안 됨, 재처리 가치 낮음 |
 | 5 | IR자료 OOS | 자체 IR은 분석 대상 아님. 비상장사 IR자료는 KRX와 무관 → OOS ir_self가 자연스러움 |
-| 6 | KRX 미매칭 + 비-IR자료 → review_needed | 사용자 #2: IPO 예정 종목 등은 KRX에 없을 수 있음 → 사람 검토 필요 |
+| 6 | KRX 미매칭 + 단일종목 → review_needed | IPO 예정 종목 등 KRX에 없는 종목 분석은 사람 검토 필요. 단 산업·전략·시황·섹터(0매칭)는 정상 케이스라 auto 통과 |
 | 7 | LLM raw audit 컬럼 보존 | 사용자 #1: 사람이 추후 검토할 수 있도록 LLM이 추출한 stock_codes/company_names raw 그대로 별도 보존 |
+| 8 | KRX lookup은 report_type별 분기 (산업·전략·시황은 skip) | 산업·전략·시황은 회사 1개로 대표 불가. 매칭 강제하면 정상 리포트가 false review_needed로 폭증 |
+| 9 | OOS row의 report_type은 LLM 분류 그대로 유지 | 분포 분석 시 더 풍부 (단일종목+foreign 등). migration 003의 IR자료 처리(`report_type='IR자료'` 유지)와 일관 |
+| 10 | name/code mismatch는 review까지 안 보냄 | confidence=medium + notes로 신호. 명백한 오류는 audit raw 컬럼으로 추후 검토 가능. review_needed는 단일종목 KRX 미매칭으로만 트리거 |
 
 ## 6. 산출물
 
 1. **migration 003** `migrations/003_v2_redesign.sql`
+   - **transaction 안에서 실행** (BEGIN/COMMIT) — 도중 실패 시 rollback
+   - 순서: ① 기존 CHECK 3개 DROP → ② 데이터 UPDATE (14→6 매핑, IR→ir_self) → ③ 컬럼 ADD/DROP → ④ 새 CHECK 3개 ADD → ⑤ GIN 인덱스 추가
    - report_type CHECK: 14종 → 6종
    - out_of_scope_reason CHECK: 4종 → 5종 (+ ir_self)
    - publisher_type CHECK: 5종 → 4종 (- company)
    - 신규 컬럼: `stock_codes_raw text[] NOT NULL DEFAULT '{}'`, `company_names_raw text[] NOT NULL DEFAULT '{}'`
+   - 신규 GIN 인덱스: `ix_reports_stocks_raw_gin`, `ix_reports_companies_raw_gin` (audit 시나리오 G)
    - drop: `topics text[]` 컬럼 + `ix_reports_topics_gin` 인덱스
    - 기존 row 마이그레이션 (§13)
 
 2. **vocabulary 변경**:
-   - `publishers.yaml` — 그대로 유지 (LLM prompt 주입용)
+   - `publishers.yaml` — `해당기업` 항목의 `publisher_type_override: company` 라인 **제거** (other 섹션 안에 그대로 두면 자동으로 publisher_type='other'). LLM이 IR자료 발행 주체를 매칭할 수 있도록 항목 자체는 유지.
    - `topics.yaml` — **삭제**
    - `taxonomy.yaml` — report_type 14→6, sector_major_aliases 유지
 
@@ -223,11 +233,13 @@ class RowState(TypedDict, total=False):
     oos_reason: Optional[Literal["foreign","fund","digital","private","ir_self"]]
 
     # resolve_krx 출력 (canonicalize+validate+enrich 통합)
-    krx_matched: bool
-    krx_entry: Optional[KRXEntry]                # 매칭 시
-    stock_codes_final: list[str]                  # KRX 매칭이면 [code], 아니면 []
-    company_names_final: list[str]                # KRX 매칭이면 [name], 아니면 raw fallback
-    sectors_major_final: list[str]
+    krx_lookup_skipped: bool                      # 산업/전략·시황은 True (KRX 시도 자체 안 함)
+    krx_matched: bool                              # 매칭 entry가 1개 이상 존재
+    krx_entries: list[KRXEntry]                    # 단일종목=0~1, 섹터=0~N, 산업/전략·시황=[]
+    krx_name_code_mismatch: bool                   # 단일종목에서 stock_code 매칭이지만 entry.name이 raw에 없음
+    stock_codes_final: list[str]                   # KRX 매칭이면 [entry.code, ...], 아니면 []
+    company_names_final: list[str]                 # KRX 매칭이면 [entry.name, ...], 아니면 raw fallback
+    sectors_major_final: list[str]                 # entries union (set 병합)
     sectors_minor_final: list[str]
     products_final: list[str]
     published_at_final: Optional[date]
@@ -240,6 +252,10 @@ class RowState(TypedDict, total=False):
 ```
 
 **제거된 키**: `topics_canon`, `topic_unmapped`, `publisher_canon`, `publisher_type` (LLM이 직접 출력해서 llm_raw에 들어감), `stock_codes_valid/unknown`, `sectors_major_valid/minor_valid/unknown`, `products_valid/unknown`. (vocab 검증 단계 자체가 사라짐.)
+
+**`krx_entry`(단일) → `krx_entries`(리스트)**: 섹터 리포트가 여러 종목을 포함할 수 있어 N개 entry aggregate가 필요. 단일종목은 [0..1], 섹터는 [0..N], 산업/전략·시황은 항상 [].
+
+**`krx_lookup_skipped`**: 산업/전략·시황은 KRX lookup을 시도하지 않으므로 `krx_matched=False`만으로 review_needed로 보내면 안 됨 — `decide_status`가 이 키를 `report_type` 분기 없이 단독 사용해도 안전하도록 보조 신호로 둠.
 
 ### 8.3 KRXIndex 변경
 
@@ -263,7 +279,10 @@ def lookup_by_name(self, name: str) -> Optional[KRXEntry]:
 - 제거: `lookup_publisher`, `map_topics`
 - 유지: `taxonomy()` (prompts.py에서 사용)
 
-`vocabulary/publishers.yaml`: 그대로 유지. **system_prompt에 본문 그대로 주입**해서 LLM이 vocab 보고 자의적 매핑.
+`vocabulary/publishers.yaml`:
+- `해당기업` 항목의 `publisher_type_override: company` 라인 **제거** ('other' 섹션 안에 두면 자동으로 publisher_type='other')
+- 항목 자체는 유지 — IR자료의 발행 주체를 LLM이 매칭할 수 있도록
+- **system_prompt에 본문 그대로 주입**해서 LLM이 vocab 보고 자의적 매핑
 
 `vocabulary/topics.yaml`: **삭제**.
 
@@ -297,11 +316,13 @@ SYSTEM_PROMPT = f"""너는 한국 주식 리서치 PDF 첫 1~3페이지를 보�
 
 각 type 정의:
 - 단일종목: 한 KRX 상장사 개별 분석. stock_codes_raw에 6자리 코드, company_names_raw에 회사명 1개.
+  → IPO 예정/상장예정 종목 분석도 단일종목으로 분류 (KRX에 코드 없을 수 있음. 시스템이 미매칭 시 review_needed로 분기). 비상장 분석이 명확하면 단일종목이 아닌 private_company_likely=true로 OOS 처리.
 - 산업: 산업(대) 단위 분석. stock_codes_raw 비움, company_names_raw 비움.
-- 섹터: 좁은 섹터/테마. stock_codes_raw/company_names_raw는 0~수개.
+- 섹터: 좁은 섹터/테마. stock_codes_raw/company_names_raw는 0~수개. 본문에 명시적으로 등장한 KRX 6자리 코드/회사명만 포함 (peer reference로 한두 개 흘리는 종목은 제외).
 - IR자료: 발행 주체 = 해당기업 자체 (자체 IR 발표자료). 분석 타겟 외이므로 자동 OOS 처리됨.
   → stock_codes_raw/company_names_raw에 회사 정보를 추출 (audit용으로 보존됨).
-- 전략·시황: 시황·데일리·매크로·퀀트·전략·테마를 모두 포함. 자산배분/톱다운 의견 포함.
+  → publisher_canon은 publishers vocabulary의 'other' 섹션 `해당기업` 항목으로 매칭 (publisher_type='other').
+- 전략·시황: 시황·데일리·매크로·퀀트·전략·테마를 모두 포함. 자산배분/톱다운 의견 포함. stock_codes_raw/company_names_raw는 비움 (회사 한두 개 peer 언급은 제외).
 - 기타: 위에 안 들어가는 것 + OOS (해외/펀드/디지털/비상장 분석).
 
 ## OOS 신호 (oos_signals) — primary coverage 중심
@@ -408,46 +429,118 @@ def mark_oos_reason(state) -> dict:
 
 ### 9.8 `resolve_krx` (신규 — canonicalize+validate+enrich 통합)
 
+`report_type`별로 KRX lookup 정책이 다르다.
+
+| report_type | KRX lookup | entry 개수 | sectors/products |
+|---|---|---|---|
+| 단일종목 | stock_code 우선, 미매칭 시 회사명 fallback | 0~1 | 매칭 entry 1개의 답 |
+| 섹터 | stock_code+회사명 모두 시도, dedupe | 0~N | entry들 union (set 병합) |
+| 산업 / 전략·시황 | **skip** (lookup 안 함) | 0 | 빈 배열 |
+| 기타 (in-scope, OOS 아님) | 단일종목과 동일 | 0~1 | 매칭 entry 1개의 답 |
+
+`name/code mismatch`는 단일종목에서 stock_code 매칭이 성공했을 때만 의미가 있으므로 그 경로에서만 감지한다 (회사명 fallback이나 섹터 N-aggregate에선 검사 안 함).
+
 ```python
 def resolve_krx(state, *, krx) -> dict:
     raw = state["llm_raw"]
+    rt = raw.report_type
 
-    # 1. KRX 매칭 시도 — stock_code 우선, 회사명 fallback
-    entry: Optional[KRXEntry] = None
+    # ── 산업 / 전략·시황: KRX lookup 자체를 skip ──────────────────────
+    if rt in ("산업", "전략·시황"):
+        return _finalize(state, raw, entries=[], skipped=True, mismatch=False)
+
+    # ── 단일종목 / 섹터 / 기타: KRX 시도 ─────────────────────────────
+    entries: list[KRXEntry] = []
+    seen: set[str] = set()
+    code_match_any = False
+
+    # 1. stock_codes_raw 모두 lookup (모든 valid code dedupe)
     for code in raw.stock_codes_raw:
         if krx.validate_code(code):
-            entry = krx.lookup(code)
-            break
-    if entry is None:
-        for name in raw.company_names_raw:
-            entry = krx.lookup_by_name(name)
-            if entry:
-                break
+            e = krx.lookup(code)
+            if e and e.code not in seen:
+                entries.append(e)
+                seen.add(e.code)
+                code_match_any = True
 
-    # 2. 매칭 결과에 따라 final 필드 set
-    if entry:
+    # 2. 단일종목/기타에서 stock_code 미매칭이면 회사명 1개 fallback
+    if rt in ("단일종목", "기타") and not entries:
+        for name in raw.company_names_raw:
+            e = krx.lookup_by_name(name)
+            if e and e.code not in seen:
+                entries.append(e)
+                seen.add(e.code)
+                break  # 단일종목/기타는 1개
+
+    # 3. 섹터에서 회사명도 모두 추가 lookup (이미 stock_code로 잡힌 것은 dedupe)
+    if rt == "섹터":
+        for name in raw.company_names_raw:
+            e = krx.lookup_by_name(name)
+            if e and e.code not in seen:
+                entries.append(e)
+                seen.add(e.code)
+
+    # 4. 단일종목/기타는 1개로 자른다 (실수로 N개가 들어와도 안전)
+    if rt in ("단일종목", "기타") and len(entries) > 1:
+        entries = entries[:1]
+
+    # 5. name/code mismatch 감지 (단일종목 + stock_code 매칭 케이스만)
+    mismatch = False
+    if rt == "단일종목" and entries and code_match_any and raw.company_names_raw:
+        norm_entry = "".join(entries[0].name.split()).lower()
+        norm_raws  = ["".join(n.split()).lower() for n in raw.company_names_raw]
+        mismatch = norm_entry not in norm_raws
+
+    return _finalize(state, raw, entries=entries, skipped=False, mismatch=mismatch)
+
+
+def _finalize(state, raw, *, entries, skipped, mismatch) -> dict:
+    """entries → final 컬럼 + published_at fallback. lookup 결과를 직렬화한다."""
+    if entries:
+        sm = []
+        smn = []
+        seen_sm: set[str] = set()
+        seen_smn: set[str] = set()
+        prods: list[str] = []
+        seen_p: set[str] = set()
+        for e in entries:
+            if e.sector_major and e.sector_major not in seen_sm:
+                sm.append(e.sector_major); seen_sm.add(e.sector_major)
+            if e.sector_minor and e.sector_minor not in seen_smn:
+                smn.append(e.sector_minor); seen_smn.add(e.sector_minor)
+            for p in krx.split_products(e.products_text):
+                if p not in seen_p:
+                    prods.append(p); seen_p.add(p)
         result = {
+            "krx_lookup_skipped": skipped,
             "krx_matched": True,
-            "krx_entry": entry,
-            "stock_codes_final": [entry.code],
-            "company_names_final": [entry.name],   # KRX 정식 표기로 통일
-            "sectors_major_final": [entry.sector_major] if entry.sector_major else [],
-            "sectors_minor_final": [entry.sector_minor] if entry.sector_minor else [],
-            "products_final": krx.split_products(entry.products_text),
+            "krx_entries": entries,
+            "krx_name_code_mismatch": mismatch,
+            "stock_codes_final": [e.code for e in entries],
+            "company_names_final": [e.name for e in entries],   # KRX 정식 표기로 통일
+            "sectors_major_final": sm,
+            "sectors_minor_final": smn,
+            "products_final": prods,
         }
     else:
-        # KRX 미매칭 — LLM raw fallback (audit 컬럼은 별도)
+        # entries가 비어있는 경우: 산업/전략·시황(skipped=True), 또는 KRX 미매칭(skipped=False)
+        if skipped:
+            company_names_final = []   # 산업/전략·시황은 회사명 자체가 의미 없음
+        else:
+            company_names_final = list(raw.company_names_raw)   # 미매칭 fallback
         result = {
+            "krx_lookup_skipped": skipped,
             "krx_matched": False,
-            "krx_entry": None,
+            "krx_entries": [],
+            "krx_name_code_mismatch": False,
             "stock_codes_final": [],
-            "company_names_final": list(raw.company_names_raw),
+            "company_names_final": company_names_final,
             "sectors_major_final": [],
             "sectors_minor_final": [],
             "products_final": [],
         }
 
-    # 3. published_at 폴백
+    # published_at 폴백
     pub = _parse_iso_date(raw.published_at)
     used_fallback = False
     if pub is None:
@@ -458,13 +551,13 @@ def resolve_krx(state, *, krx) -> dict:
         used_fallback = True
     result["published_at_final"] = pub
     result["used_sent_at_fallback"] = used_fallback
-
     return result
 ```
 
 **핵심 단순화**:
 - LLM이 sectors/products를 추출 안 하므로 검증 단계 불필요
-- KRX entry 1개로 sectors_major/minor/products 모두 결정 (산업 합류 로직 불필요 — KRX 한 row가 한 종목의 모든 답)
+- 산업/전략·시황은 KRX 시도 안 함 (회사 1개로 대표 불가) — `krx_lookup_skipped=True`로 표시해 `decide_status`가 review_needed로 보내지 않게 함
+- 단일종목/기타: 1 entry, 섹터: N entry union
 - publisher는 LLM이 이미 canonical로 출력 — 별도 노드 불필요
 
 ### 9.9 `decide_status` (단순화)
@@ -480,26 +573,32 @@ def decide_status(state) -> dict:
 
     # OOS 케이스는 status_oos가 이미 처리. 여기 도달하면 in-scope.
     raw = state.get("llm_raw")
-    
-    # KRX 미매칭 + in-scope (= IPO 예정 등 KRX에 없는 종목 분석)
-    if not state.get("krx_matched"):
+    rt = raw.report_type if raw else None
+
+    # 단일종목 + KRX 미매칭만 review_needed (IPO 예정/상장예정/오타 등)
+    # 산업/전략·시황은 krx_lookup_skipped=True로 매칭이 의미 없음 → auto OK
+    # 섹터는 0개 매칭이어도 정상 케이스 (peer reference 없는 산업·테마 리포트) → auto OK
+    if rt == "단일종목" and not state.get("krx_matched"):
         return {"tagging_status":"review_needed","tagging_confidence":"low",
-                "tagging_notes":"krx_unmatched_in_scope"}
+                "tagging_notes":"krx_unmatched_in_scope:ipo_pending_or_unknown"}
 
     # type_indeterminate (LLM이 자체 신뢰도 low이고 report_type='기타')
-    if raw is not None and raw.report_type == "기타" and raw.self_confidence == "low":
+    if rt == "기타" and raw is not None and raw.self_confidence == "low":
         return {"tagging_status":"review_needed","tagging_confidence":"low",
                 "tagging_notes":"type_indeterminate"}
 
-    # KRX 매칭 + in-scope = auto. confidence는 폴백 신호로만 결정.
+    # in-scope auto. confidence는 폴백/mismatch 신호로 결정.
     used_fallback = (
         state.get("used_sent_at_fallback")
         or len(state.get("pages_used") or [1]) > 1
     )
+    name_code_mismatch = bool(state.get("krx_name_code_mismatch"))
+    confidence = "medium" if (used_fallback or name_code_mismatch) else "high"
+    notes = "krx_name_code_mismatch" if name_code_mismatch else None
     return {
         "tagging_status": "auto",
-        "tagging_confidence": "medium" if used_fallback else "high",
-        "tagging_notes": None,
+        "tagging_confidence": confidence,
+        "tagging_notes": notes,
     }
 ```
 
@@ -508,25 +607,35 @@ def decide_status(state) -> dict:
 - topic_unmapped (topics 폐기)
 - publisher_canon=None 분기 (LLM이 직접 매핑 — null이어도 정상 케이스)
 
-review_needed 트리거: `pdf_unreadable`, `llm_refusal`, `krx_unmatched_in_scope`, `type_indeterminate` 4종.
+**review_needed 트리거** (4종): `first_page_unreadable`, `llm_refusal:*`, `krx_unmatched_in_scope:ipo_pending_or_unknown`, `type_indeterminate`.
+
+**`auto/medium` 신호** (`high`로 두지 않는 케이스): `used_fallback`(published_at sent_at fallback 또는 1p가 아닌 페이지 사용) 또는 `krx_name_code_mismatch`. 둘 다 audit raw 컬럼으로 추후 확인 가능 — review까지 강제하진 않음.
 
 ### 9.10 `write` (변경)
 
 UPDATE_SQL 컬럼 변경 — `topics` 제거, `stock_codes_raw`/`company_names_raw` 추가. payload는 19-arg 위치 placeholder.
+
+OOS row 처리 정책:
+- **`report_type`은 LLM 분류 그대로 유지** (예: `단일종목+foreign`, `IR자료+ir_self`). 강제 변환 없음 → migration 003의 IR자료 처리(`report_type='IR자료'` 유지)와 일관.
+- **publisher_canon/publisher_type은 LLM 출력 그대로 유지**. IR자료의 발행 주체는 LLM이 publishers vocabulary의 `해당기업`을 보고 매칭하므로 신규/migrated row 모두 `publisher='해당기업', publisher_type='other'`로 통일됨.
+- 분석가/title은 비-OOS와 동일하게 보존 (분포 분석 풍부).
+- 분류 본체(stock_codes/company_names/sectors/products)는 비움.
+- audit raw(stock_codes_raw/company_names_raw)는 OOS도 LLM 출력 그대로 보존.
 
 ```python
 def _build_payload(state, taxonomy_version) -> tuple:
     raw = state.get("llm_raw")
     is_oos = bool(state.get("is_oos"))
 
-    # OOS 케이스 — 분류 메타 비우고 audit raw는 그대로 남김
+    # OOS 케이스
     if is_oos:
         return (
             state["id"],                                  # $1
             None,                                          # $2 published_at (OOS는 null)
-            "기타",                                        # $3 report_type 강제
-            None, None,                                    # $4,$5 publisher 모두 null
-            [],                                            # $6 analysts 비움
+            (raw.report_type if raw else None),            # $3 report_type — LLM 분류 그대로 (IR자료는 'IR자료')
+            (raw.publisher_canon if raw else None),        # $4 publisher_canon
+            (raw.publisher_type if raw else None),         # $5 publisher_type
+            list(raw.analysts) if raw else [],             # $6 analysts
             (raw.title if raw else None),                  # $7 title 보존
             [],                                            # $8 stock_codes
             [],                                            # $9 company_names
@@ -540,7 +649,7 @@ def _build_payload(state, taxonomy_version) -> tuple:
             taxonomy_version,                              # $19
         )
 
-    # 가독 실패
+    # 가독 실패 (raw 없음)
     if raw is None:
         return (
             state["id"], None, None, None, None, [], None,
@@ -619,55 +728,100 @@ def build_graph(client, sb, *, krx, dry_run, taxonomy_version):
 review_reasons = {first_page_unreadable, llm_refusal, type_indeterminate, krx_unmatched_in_scope}
 ```
 
+매칭 방식: `tagging_notes`가 prefix 형태(`krx_unmatched_in_scope:ipo_pending_or_unknown`, `llm_refusal:<error>`)이므로 `:` 앞 prefix만 비교. `krx_name_code_mismatch`는 review_needed가 아닌 `auto/medium` notes이므로 review_reasons에 포함되지 않음 (audit 시나리오 G에서 별도로 조회).
+
 ## 11. migration 003
+
+핵심: 기존 CHECK 제약이 `'전략·시황'`, `'ir_self'`를 포함하지 않으므로 **데이터 UPDATE 전에 DROP CONSTRAINT 먼저**. 전체를 단일 transaction으로 wrap해서 도중 실패 시 rollback.
 
 ```sql
 -- migrations/003_v2_redesign.sql
 
--- 1. 기존 데이터 마이그레이션 (14종 → 6종 매핑)
+BEGIN;
+
+-- ============================================================
+-- 1. 기존 CHECK 제약 DROP (UPDATE에서 새 enum value를 쓸 수 있도록)
+-- ============================================================
+ALTER TABLE reports DROP CONSTRAINT IF EXISTS chk_report_type;
+ALTER TABLE reports DROP CONSTRAINT IF EXISTS chk_out_of_scope_reason;
+ALTER TABLE reports DROP CONSTRAINT IF EXISTS chk_publisher_type;
+
+-- ============================================================
+-- 2. 기존 데이터 마이그레이션 (14종 → 6종 매핑)
 --    그대로 유지하는 5종 (단일종목/산업/섹터/IR자료/기타)은 손대지 않음.
+-- ============================================================
 UPDATE reports SET report_type = '전략·시황'
  WHERE report_type IN ('시황·데일리','거시·매크로','퀀트·전략','전략·테마');
+
 UPDATE reports SET report_type = '단일종목'
  WHERE report_type = 'IPO';   -- IPO 분석은 한 종목 분석 본질. KRX 미매칭이면 review_needed로 빠짐.
+
 UPDATE reports SET report_type = '산업'
  WHERE report_type IN ('ESG','부동산·리츠','파생·원자재','채권·크레딧');
 
--- 2. 기존 publisher_type='company' (자체 IR) → 'other' + 동시에 OOS ir_self
---    이건 IR자료 데이터를 OOS로 옮기는 마이그레이션
+-- 3. IR자료 데이터를 OOS ir_self로 이전
+--    publisher_type='company'를 'other'로 정리 (CHECK가 4종으로 줄어들기 때문)
+--    report_type='IR자료'은 그대로 유지 — A=α 결정 (LLM 분류 그대로 보존)
 UPDATE reports
    SET out_of_scope_reason = 'ir_self',
        publisher_type      = 'other',
        publisher           = COALESCE(publisher, '해당기업')
  WHERE report_type = 'IR자료';
 
--- 3. CHECK 제약 갱신 (DROP+ADD)
-ALTER TABLE reports DROP CONSTRAINT chk_report_type;
+-- ============================================================
+-- 4. 컬럼 ADD/DROP
+-- ============================================================
+ALTER TABLE reports
+  ADD COLUMN IF NOT EXISTS stock_codes_raw   text[] NOT NULL DEFAULT '{}',
+  ADD COLUMN IF NOT EXISTS company_names_raw text[] NOT NULL DEFAULT '{}';
+
+DROP INDEX IF EXISTS ix_reports_topics_gin;
+ALTER TABLE reports DROP COLUMN IF EXISTS topics;
+
+-- ============================================================
+-- 5. 새 CHECK 제약 ADD
+-- ============================================================
 ALTER TABLE reports ADD CONSTRAINT chk_report_type CHECK (
   report_type IS NULL OR report_type IN
   ('단일종목','산업','섹터','IR자료','전략·시황','기타')
 );
 
-ALTER TABLE reports DROP CONSTRAINT chk_out_of_scope_reason;
 ALTER TABLE reports ADD CONSTRAINT chk_out_of_scope_reason CHECK (
   out_of_scope_reason IS NULL OR out_of_scope_reason IN
   ('foreign','fund','digital','private','ir_self')
 );
 
-ALTER TABLE reports DROP CONSTRAINT chk_publisher_type;
 ALTER TABLE reports ADD CONSTRAINT chk_publisher_type CHECK (
   publisher_type IS NULL OR publisher_type IN
   ('broker','data_provider','ir_agency','other')
 );
 
--- 4. audit 컬럼 추가
-ALTER TABLE reports
-  ADD COLUMN IF NOT EXISTS stock_codes_raw   text[] NOT NULL DEFAULT '{}',
-  ADD COLUMN IF NOT EXISTS company_names_raw text[] NOT NULL DEFAULT '{}';
+-- ============================================================
+-- 6. audit raw 컬럼 GIN 인덱스 (시나리오 G — KRX 미매칭 분석)
+-- ============================================================
+CREATE INDEX IF NOT EXISTS ix_reports_stocks_raw_gin
+  ON reports USING gin (stock_codes_raw);
+CREATE INDEX IF NOT EXISTS ix_reports_companies_raw_gin
+  ON reports USING gin (company_names_raw);
 
--- 5. topics 제거 (인덱스 + 컬럼)
-DROP INDEX IF EXISTS ix_reports_topics_gin;
-ALTER TABLE reports DROP COLUMN IF EXISTS topics;
+COMMIT;
+```
+
+**적용 전 분포 확인** (B=α 결정대로 14→6 매핑은 진행하되 분포는 사전 확인 권장):
+
+```sql
+-- 14종 매핑 영향 범위 확인
+SELECT report_type, count(*) FROM reports
+ WHERE report_type IN ('시황·데일리','거시·매크로','퀀트·전략','전략·테마',
+                       'IPO','ESG','부동산·리츠','파생·원자재','채권·크레딧')
+ GROUP BY report_type ORDER BY count(*) DESC;
+
+-- IR자료 → OOS ir_self 영향 범위
+SELECT count(*) FROM reports WHERE report_type = 'IR자료';
+
+-- 기존 CHECK 제약 안에 'company' publisher_type이 얼마나 있는지
+SELECT publisher_type, count(*) FROM reports
+ WHERE publisher_type = 'company' GROUP BY publisher_type;
 ```
 
 ## 12. 활용 시나리오 (변경)
@@ -681,47 +835,50 @@ ALTER TABLE reports DROP COLUMN IF EXISTS topics;
 | D | 발행 주체·애널리스트별 | publisher canonical 통일 (LLM 자의적 매핑) |
 | E | 제목 키워드 | 그대로 |
 | F | 비-종목 토픽 | **폐기** — topics 컬럼 자체 없음. 운영 필요 시 title ILIKE으로 대체 |
-| G (신규) | KRX 미매칭 분석 (audit) | `krx_unmatched_in_scope`인 row의 `stock_codes_raw`/`company_names_raw` 검토 |
-| H (신규) | OOS IR자료 분포 | `out_of_scope_reason='ir_self'` |
+| G (신규) | KRX 미매칭 분석 (audit) | `tagging_notes LIKE 'krx_unmatched_in_scope%'` 또는 `tagging_notes='krx_name_code_mismatch'`인 row의 `stock_codes_raw`/`company_names_raw` 검토 |
+| H (신규) | OOS IR자료 분포 | `out_of_scope_reason='ir_self'` (report_type='IR자료'와 일관) |
+| I (신규) | OOS 분포의 type별 분석 | `report_type` × `out_of_scope_reason` 교차 (예: 단일종목+foreign 비중) — OOS row의 report_type을 강제 변환 안 했기 때문에 가능 |
 
 ## 13. 기존 row 처리 (마이그레이션)
 
 inspect 결과: `auto=3,317`, `review_needed=73`, `oos_total=151`. 이 데이터는 v1 14종으로 분류됨.
 
-migration 003의 step 1·2가 자동으로 처리:
-- 14종 → 6종 mapping
-- IR자료 row → OOS ir_self 추가
+migration 003의 step 2·3이 자동으로 처리:
+- step 2: 14종 → 6종 매핑 (시황·데일리/거시·매크로/퀀트·전략/전략·테마 → 전략·시황, IPO → 단일종목, ESG/부동산·리츠/파생·원자재/채권·크레딧 → 산업)
+- step 3: IR자료 row → `out_of_scope_reason='ir_self'`, `publisher_type='other'`, `publisher` null이면 '해당기업'. **`report_type='IR자료'`은 그대로 유지** (A=α 결정).
 
 기존 `topics` 데이터는 컬럼과 함께 폐기. 운영자가 백업이 필요하면 migration 전에 export 권장.
 
 기존 `stock_codes`/`company_names`는 그대로 남음. v1에서는 v2의 `stock_codes_final`에 해당. v2 신규 row만 `stock_codes_raw`/`company_names_raw`가 채워짐 (기존 row는 audit 비어있음).
 
+기존 OOS row (151건)의 `report_type`은 LLM이 v1에서 분류한 14종 그대로 — migration step 2의 매핑으로 6종에 정렬됨. v2의 OOS write 정책도 `report_type`을 LLM 분류 그대로 보존하므로, 신규/기존 OOS row의 schema가 일관됨.
+
 ## 14. v1 commit 매핑 (incremental rev-5)
 
 | v1 영역 | v2 변경 |
 |---|---|
-| Task 1 (migration 002 + KRX CSV) | migration 003 추가 (003 = 002에 ALTER) |
+| Task 1 (migration 002 + KRX CSV) | migration 003 추가: BEGIN/COMMIT transaction wrap, DROP CONSTRAINT 먼저, 14→6 매핑 + IR→ir_self UPDATE, 컬럼 ADD/DROP, 새 CHECK ADD, raw GIN 인덱스 2개 |
 | Task 2 (package skeleton) | 그대로 |
-| Task 3 (taxonomy/publishers/topics YAML) | topics.yaml **삭제**, taxonomy.yaml report_types 6종으로 |
+| Task 3 (taxonomy/publishers/topics YAML) | topics.yaml **삭제**, taxonomy.yaml report_types 6종/oos 5종/publisher_type 4종, **publishers.yaml의 `해당기업: publisher_type_override: company` 라인 제거** |
 | Task 4 (vocabulary __init__) | `lookup_publisher`/`map_topics` 삭제. `taxonomy()` 유지 |
 | Task 5 (KRX index) | `lookup_by_name` 신규, `has_product`/`filter_*` 삭제 |
-| Task 6 (state.py + llm_schemas.py) | 둘 다 v2 schema로 재정의 |
-| Task 7 (prompts.py) | publishers.yaml 본문 주입, 6종 enum, 1~3p |
+| Task 6 (state.py + llm_schemas.py) | 둘 다 v2 schema로 재정의. RowState에 `krx_lookup_skipped`/`krx_entries`/`krx_name_code_mismatch` 추가 |
+| Task 7 (prompts.py) | publishers.yaml 본문 주입, 6종 enum, 1~3p, 단일종목 정의에 IPO 예정 명시, IR자료 publisher 매칭 안내 |
 | Task 8 (extract_pdf) | max_pages=3 |
 | Task 9 (llm_extract) | 그대로 (호출만, schema는 새 LLMExtraction) |
 | Task 10 (oos_gate + mark_oos_reason) | 둘 다 룰 변경 (IR자료 분기 + ir_self) |
-| Task 11 (status_oos + status_unreadable) | 그대로 |
+| Task 11 (status_oos + status_unreadable) | 그대로. confidence: foreign/fund/digital/ir_self=high, private=medium |
 | Task 12 (canonicalize) | **삭제** |
 | Task 13 (validate) | **삭제** |
-| Task 14 (enrich) | **삭제 + resolve_krx 신규** |
-| Task 15 (decide_status) | 단순화 |
-| Task 16 (write + supabase_io) | UPDATE_SQL 19개 placeholder, 컬럼 변경 |
+| Task 14 (enrich) | **삭제 + resolve_krx 신규** — report_type별 분기 (단일종목 1 / 섹터 N / 산업·전략·시황 skip / 기타 1) + name_code_mismatch 감지 + entries union |
+| Task 15 (decide_status) | 단순화. review_needed는 단일종목+krx_unmatched / type_indeterminate / pdf_unreadable / llm_refusal 4종만. mismatch는 `auto/medium`으로 강등 |
+| Task 16 (write + supabase_io) | UPDATE_SQL 19개 placeholder, 컬럼 변경. **OOS payload는 LLM의 report_type/publisher_canon/publisher_type/title/analysts 모두 보존** (`'기타'` 강제 안 함) |
 | Task 17 (graph assembly) | 노드 wiring 변경 (8 노드) |
-| Task 18 (orchestrator) | 그대로 (review_reasons set만 갱신) |
+| Task 18 (orchestrator) | 그대로 (review_reasons set: `first_page_unreadable`, `llm_refusal`, `krx_unmatched_in_scope`, `type_indeterminate`) |
 | Task 19 (config + CLI) | 그대로 |
-| Task 20 (parity) | fixtures 6종/5 OOS로 재구성 |
+| Task 20 (parity) | fixtures 6종/5 OOS로 재구성. mismatch 케이스 fixture 1개 추가 권장 |
 | Task 21 (golden PDFs) | 그대로 (여전히 유효) |
-| Task 22 (live verification) | 새로 dry-run 후 진행 |
+| Task 22 (live verification) | migration 003 적용 → 새로 dry-run → 결과 검토 |
 
 ## 15. 의존성 (변경 없음)
 
@@ -729,4 +886,14 @@ migration 003의 step 1·2가 자동으로 처리:
 
 ## 16. brainstorming → 구현 분기
 
-본 spec의 후속 단계는 superpowers의 `writing-plans` skill로 v2 task list 작성. 변경 폭이 크므로 ~10~15 task 예상 (대부분 기존 코드 변경, 일부 삭제, 1개 신규 노드).
+본 spec의 후속 단계는 superpowers의 `writing-plans` skill로 v2 task list 작성. 변경 폭이 크지만 v1의 22 task에 매핑되므로 ~12~15 task 예상 (대부분 기존 코드 변경, 3개 삭제, 1개 신규 노드, migration 003 + publishers.yaml 정정).
+
+**우선 순위**:
+1. migration 003 (transaction wrap, DROP→UPDATE→ADD 순서) — 다른 모든 변경의 기반
+2. publishers.yaml 정리 + taxonomy.yaml 6종/4종 — vocab 정합성
+3. llm_schemas + state — 새 schema
+4. prompts — 새 vocabulary 주입
+5. resolve_krx 신규 + canonicalize/validate/enrich 삭제 — 노드 흐름
+6. decide_status + write — 새 정책 반영
+7. 테스트 + parity fixtures 재구성
+8. dry-run 후 live verification
