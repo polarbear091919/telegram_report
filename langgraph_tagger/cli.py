@@ -113,7 +113,7 @@ def main(argv: list[str] | None = None) -> int:
 
     args = p.parse_args(argv)
     cfg = load_config()
-    args.batch_size = args.batch_size or (cfg.batch_size_default if hasattr(args, "batch_size") else None)
+    args.batch_size = getattr(args, "batch_size", None) or cfg.batch_size_default
 
     if args.cmd == "run":
         asyncio.run(_cmd_run(args, cfg))

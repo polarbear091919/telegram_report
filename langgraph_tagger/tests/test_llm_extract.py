@@ -73,3 +73,30 @@ async def test_transient_errors_raise_OpenAITransientError(mock_openai_client, e
     }
     with pytest.raises(OpenAITransientError):
         await llm_extract(state, client=mock_openai_client)
+
+
+@pytest.mark.asyncio
+async def test_validation_error_wrapped_as_OpenAITransientError(mock_openai_client):
+    """Pydantic ValidationError on parse() must surface as OpenAITransientError
+    so the orchestrator records it under transient_errors and reverts the row
+    to pending (per spec §9.3)."""
+    from pydantic import BaseModel, ValidationError
+
+    class _Bad(BaseModel):
+        x: int
+
+    try:
+        _Bad(x="not_an_int")
+    except ValidationError as e:
+        pydantic_err = e
+
+    mock_openai_client.set_exception(pydantic_err)
+    state = {
+        "model": "gpt-5.4-mini",
+        "pdf_text": "x",
+        "file_name": "x.pdf",
+        "caption": None,
+        "sent_at": __import__("datetime").datetime(2026, 5, 1, 9, 0),
+    }
+    with pytest.raises(OpenAITransientError):
+        await llm_extract(state, client=mock_openai_client)

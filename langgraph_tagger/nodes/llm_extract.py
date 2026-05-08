@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from openai import APITimeoutError, AsyncOpenAI, InternalServerError, RateLimitError
+from pydantic import ValidationError
 
 from langgraph_tagger.llm_schemas import LLMExtraction
 from langgraph_tagger.prompts import SYSTEM_PROMPT, user_message
@@ -35,7 +36,7 @@ async def llm_extract(state: RowState, *, client: AsyncOpenAI) -> dict:
             response_format=LLMExtraction,
             temperature=0,
         )
-    except (RateLimitError, APITimeoutError, InternalServerError) as e:
+    except (RateLimitError, APITimeoutError, InternalServerError, ValidationError) as e:
         raise OpenAITransientError(str(e)) from e
 
     msg = completion.choices[0].message
