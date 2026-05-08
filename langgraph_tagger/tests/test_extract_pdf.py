@@ -66,11 +66,11 @@ async def test_blank_first_page_falls_back_to_p2():
 
 
 @pytest.mark.asyncio
-async def test_no_meta_walks_all_5_then_returns_text():
+async def test_no_meta_walks_all_3_then_returns_text():
     state = {"file_path": str(GOLDEN / "no_meta_anywhere.pdf")}
     out = await extract_pdf(state)
-    # No meta signals found → walked up to 5 pages
-    assert out["pages_used"] == [1, 2, 3, 4, 5]
+    # No meta signals found → walked up to 3 pages (v2)
+    assert out["pages_used"] == [1, 2, 3]
     # Text is non-empty (so pdf_unreadable False) but extraction is incomplete
     assert out["pdf_text"]
     assert out["pdf_unreadable"] is False
@@ -89,3 +89,21 @@ def test_meta_signals_detector():
     assert _has_meta_signals("분석가 김민수 투자의견 매수 목표주가") is True
     assert _has_meta_signals("키움증권 Research") is True
     assert _has_meta_signals("그냥 평범한 텍스트입니다") is False
+
+
+def test_extract_pdf_max_pages_is_3(monkeypatch, tmp_path):
+    """v2: max_pages는 3 (기존 v1의 5에서 축소)."""
+    import fitz
+    from langgraph_tagger.nodes.extract_pdf import _sync_extract
+
+    pdf = tmp_path / "five_pages.pdf"
+    doc = fitz.open()
+    for i in range(5):
+        # Insert non-meta text so _has_meta_signals() never triggers early stop
+        doc.new_page().insert_text((72, 72), f"page-{i+1}-content", fontsize=11)
+    doc.save(pdf)
+    doc.close()
+
+    out = _sync_extract(pdf)  # uses default max_pages
+    # v2: should stop at 3
+    assert out["pages_used"] == [1, 2, 3]

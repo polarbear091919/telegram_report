@@ -32,7 +32,7 @@ def _resolve(file_path: str) -> Path:
     return base / p
 
 
-def _sync_extract(path: Path, max_pages: int = 5) -> dict:
+def _sync_extract(path: Path, max_pages: int = 3) -> dict:
     if not path.exists():
         return {"pdf_text": "", "pages_used": [], "pdf_unreadable": True}
     try:
