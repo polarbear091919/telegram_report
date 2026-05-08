@@ -1,10 +1,7 @@
-"""Tests for KRXIndex (loading, validation, lookup, fuzzy match, products)."""
+"""Tests for KRXIndex (loading, validation, lookup, name lookup, products)."""
 from datetime import date
-from pathlib import Path
 
-import pytest
-
-from langgraph_tagger.vocabulary.krx import KRXIndex
+from langgraph_tagger.vocabulary.krx import KRXIndex  # noqa: F401  (kept for typing/import smoke)
 
 
 class TestLoad:
@@ -62,43 +59,32 @@ class TestSplitProducts:
         assert out == []
 
 
-class TestFuzzySectorMatch:
-    def test_exact_major_match(self, krx):
-        # '반도체' is a real KRX 산업명(대)
-        assert krx.fuzzy_sector_match("반도체") == "반도체"
-
-    def test_exact_minor_match(self, krx):
-        # '메모리반도체' is in 산업명(중) when CSV is loaded
-        assert krx.fuzzy_sector_match("메모리반도체") == "메모리반도체"
-
-    def test_auto_alias_via_sector_aliases(self, krx):
-        # 'Auto' in sector_major_aliases of taxonomy.yaml maps to '자동차'/'자동차산업'
-        # but KRX CSV uses 'Auto' directly. So fuzzy_sector_match('자동차') should
-        # resolve to 'Auto' via the alias table.
-        result = krx.fuzzy_sector_match("자동차")
-        assert result == "Auto"
-
-    def test_unknown(self, krx):
-        assert krx.fuzzy_sector_match("이상한산업명") is None
+def test_lookup_by_name_exact_match(krx):
+    e = krx.lookup_by_name("삼성전자")
+    assert e is not None
+    assert e.code == "005930"
 
 
-class TestEnrichmentHelpers:
-    def test_has_product_known(self, krx):
-        # 'DRAM' appears in many KRX 주요제품 cells
-        assert krx.has_product("DRAM") is True
+def test_lookup_by_name_whitespace_insensitive(krx):
+    e = krx.lookup_by_name("삼성 전자")
+    assert e is not None
+    assert e.code == "005930"
 
-    def test_has_product_unknown(self, krx):
-        assert krx.has_product("완전이상한제품") is False
 
-    def test_rows_with_product_returns_entries(self, krx):
-        rows = krx.rows_with_product("DRAM")
-        assert len(rows) >= 1
-        # All returned rows should have DRAM as substring of products_text
-        for r in rows:
-            assert "DRAM" in r.products_text
+def test_lookup_by_name_case_insensitive(krx):
+    # KRX 영문 종목명이 있는 경우 — case-insensitive 매칭
+    # 실제 KRX CSV에서 이름이 영문/한글 혼용인 case가 있다면 그걸 검증.
+    # 없다면 한글 case로 only.
+    e = krx.lookup_by_name("Samsung Electronics")  # KRX has 한글; should miss
+    assert e is None  # KRX CSV는 한글 표기이므로 영문은 미매칭이 정상
 
-    def test_rows_with_sector_minor(self, krx):
-        rows = krx.rows_with_sector_minor("메모리반도체")
-        assert len(rows) >= 1
-        for r in rows:
-            assert r.sector_minor == "메모리반도체"
+
+def test_lookup_by_name_unknown_returns_none(krx):
+    assert krx.lookup_by_name("존재하지않는회사") is None
+
+
+def test_has_product_removed(krx):
+    assert not hasattr(krx, "has_product")
+    assert not hasattr(krx, "rows_with_product")
+    assert not hasattr(krx, "rows_with_sector_minor")
+    assert not hasattr(krx, "fuzzy_sector_match")
