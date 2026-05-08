@@ -31,7 +31,7 @@ def test_digital():
 
 def test_private_only():
     # When only private_company_likely is true (and oos_gate already excluded
-    # the IR자료/IPO/KRX-matched exceptions), result is 'private'.
+    # the KRX-matched exception), result is 'private'.
     out = mark_oos_reason(_state(private=True))
     assert out == {"is_oos": True, "oos_reason": "private"}
 
@@ -40,3 +40,14 @@ def test_priority_foreign_beats_others():
     # If multiple flags are true, foreign takes priority (matches oos_gate routing order)
     out = mark_oos_reason(_state(foreign=True, etf=True, digital=True, private=True))
     assert out["oos_reason"] == "foreign"
+
+
+def test_ir_material_yields_ir_self_reason():
+    # v2: IR자료 → auto OOS ir_self (priority over signals)
+    raw = make_llm_extraction(
+        report_type="IR자료",
+        publisher_canon="해당기업",
+        publisher_type="other",
+    )
+    out = mark_oos_reason({"llm_raw": raw})
+    assert out == {"is_oos": True, "oos_reason": "ir_self"}
