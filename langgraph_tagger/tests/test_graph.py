@@ -10,7 +10,7 @@ from langgraph_tagger.tests.conftest import make_llm_extraction
 @pytest.mark.asyncio
 async def test_in_scope_single_stock_flows_end_to_end(krx, mock_openai_client, mock_supabase, tmp_path, monkeypatch):
     """In-scope 경로의 진짜 end-to-end. tiny PDF 합성으로 extract_pdf 통과시키고
-    canonicalize → validate → enrich → decide_status → write까지 검증."""
+    resolve_krx → decide_status → write까지 검증."""
     import fitz
     pdf = tmp_path / "samsung.pdf"
     doc = fitz.open()
@@ -49,14 +49,14 @@ async def test_in_scope_single_stock_flows_end_to_end(krx, mock_openai_client, m
     # In-scope path: not OOS, not unreadable
     assert final["tagging_status"] == "auto"
     assert final.get("is_oos") is not True
-    # write was called once with the expected canonicalized payload
+    # write was called once with the expected resolved payload
     assert len(mock_supabase.executed) == 1
     sql, args = mock_supabase.executed[0]
     assert args[2] == "단일종목"          # report_type
     assert args[3] == "키움증권"           # publisher canonical
     assert args[4] == "broker"             # publisher_type
-    assert "005930" in args[7]             # stock_codes
-    assert args[13] is None                # out_of_scope_reason
+    assert "005930" in args[7]             # stock_codes_final
+    assert args[14] is None                # out_of_scope_reason
 
 
 @pytest.mark.asyncio
@@ -130,4 +130,27 @@ async def test_oos_foreign_short_circuits_to_status_oos(krx, mock_openai_client,
     assert len(mock_supabase.executed) == 1
     sql, args = mock_supabase.executed[0]
     assert args[2] == "기타"
-    assert args[13] == "foreign"
+    assert args[14] == "foreign"
+
+
+def test_graph_has_8_nodes():
+    """v2 graph has 8 nodes (down from v1's 10)."""
+    from unittest.mock import MagicMock
+    from pathlib import Path
+    from langgraph_tagger.graph import build_graph
+    from langgraph_tagger.vocabulary.krx import KRXIndex
+
+    krx = KRXIndex.load(Path("docs/stock_data/KRX_stocks_data.csv"))
+    app = build_graph(
+        client=MagicMock(), sb=MagicMock(),
+        krx=krx, dry_run=True, taxonomy_version="t",
+    )
+    # LangGraph compiled app exposes nodes via .get_graph().nodes (1.0 API).
+    nodes = app.get_graph().nodes
+    # Subtract LangGraph's internal __start__/__end__ nodes if present.
+    user_nodes = {n for n in nodes if not n.startswith("__")}
+    assert user_nodes == {
+        "extract_pdf", "llm_extract", "mark_oos_reason",
+        "status_oos", "status_unreadable", "resolve_krx",
+        "decide_status", "write",
+    }
