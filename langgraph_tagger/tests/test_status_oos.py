@@ -1,0 +1,17 @@
+import pytest
+from langgraph_tagger.nodes.status_oos import status_oos
+
+
+@pytest.mark.parametrize("reason,expected_conf", [
+    ("foreign", "high"),
+    ("fund", "high"),
+    ("digital", "high"),
+    ("private", "medium"),
+])
+def test_status_oos_sets_status_and_confidence(reason, expected_conf):
+    state = {"oos_reason": reason}
+    out = status_oos(state)
+    assert out["is_oos"] is True
+    assert out["tagging_status"] == "auto"
+    assert out["tagging_confidence"] == expected_conf
+    assert out["tagging_notes"] is None
