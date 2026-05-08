@@ -1,37 +1,25 @@
-# Source-of-truth enums for langgraph_tagger.
-# Mirrors migrations/002_tagging_columns.sql CHECK constraints
-# and the 14-type taxonomy from friendly-mclaren skill.
+# Source-of-truth enums for langgraph_tagger v2.
+# Mirrors migrations/003_v2_redesign.sql CHECK constraints
+# (6 report_types, 5 oos_reasons, 4 publisher_types).
+
 report_types:
   - 단일종목
   - 산업
   - 섹터
-  - 시황·데일리
-  - 거시·매크로
-  - 퀀트·전략
-  - 전략·테마
-  - IPO
-  - ESG
-  - 부동산·리츠
-  - 파생·원자재
-  - 채권·크레딧
   - IR자료
+  - 전략·시황
   - 기타
 
-oos_reasons: [foreign, fund, digital, private]
-publisher_types: [broker, company, data_provider, ir_agency, other]
+oos_reasons: [foreign, fund, digital, private, ir_self]
+publisher_types: [broker, data_provider, ir_agency, other]
 tagging_statuses: [pending, processing, auto, review_needed, verified]
 tagging_confidences: [high, medium, low]
 
-# Sector-major canonical with alias rules
-# (KRX CSV is the authoritative source; this list is for fuzzy match only.)
-sector_major_aliases:
-  Auto: ["자동차", "자동차산업", "Automotive"]
-
-# Reference-only: precedence rules (codes implement these in oos_gate / decide_status)
+# Reference-only: precedence rules (codes implement these in oos_gate / decide_status / resolve_krx)
 precedence_rules:
-  - "OOS patterns override all other classification (Rule 1)"
-  - "Asset class beats filename prefix: 산업_부동산_ → 부동산·리츠 etc. (Rule 2)"
-  - "Listed-company IPO update is 단일종목, not IPO (Rule 3)"
-  - "IPO vs OOS private: KRX-matched code → in-scope (Rule 4)"
-  - "publisher_type=company (self IR) is in-scope IR자료 even if unlisted (Rule 4)"
-  - "Ambiguous prefix → header keywords; else type_indeterminate (Rule 5)"
+  - "OOS patterns override all other classification (foreign/fund/digital/private)"
+  - "report_type='IR자료' → automatic OOS ir_self (separate branch in oos_gate)"
+  - "단일종목 + KRX unmatched → review_needed (IPO pending or unknown)"
+  - "산업/전략·시황 → KRX lookup skipped (entry == None is normal)"
+  - "섹터 → KRX lookup over all stock_codes_raw + company_names_raw, union sectors/products"
+  - "단일종목 stock_code matched but company name not in raw → krx_name_code_mismatch (auto/medium)"

@@ -90,7 +90,6 @@ ir_agency:
 
 other:
   - canonical: 해당기업
-    publisher_type_override: company
     aliases: []
   - canonical: KRX
     aliases: ["한국거래소"]
