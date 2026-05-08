@@ -259,7 +259,10 @@ REPORT_TYPES = Literal[
 ]
 
 class OOSSignals(BaseModel):
-    foreign_ticker_seen: bool
+    """LLM-observed primary-coverage signals. 'primary coverage'를 강조해
+    국내 리포트의 해외 peer/벨류체인 언급은 false로 처리.
+    """
+    foreign_primary_coverage: bool   # primary coverage가 해외 상장사 (peer 언급은 false)
     etf_or_fund: bool
     digital_asset: bool
     private_company_likely: bool
@@ -515,40 +518,68 @@ async def llm_extract(state: RowState, *, client: AsyncOpenAI) -> dict:
 
 `temperature=0`으로 일관성 우선. 한국어 분류에 mini는 충분 (5.4 mini의 SWE-bench 점수가 5.4 standard에 매우 근접).
 
-### 8.3 `oos_gate` (3-way 조건부 분기)
+### 8.3 `oos_gate` (3-way 조건부 분기, routing-only)
+
+LangGraph 1.0의 `add_conditional_edges` routing function은 string label만 반환해야 한다 (state mutation 금지). `oos_reason` set은 별도 노드 `mark_oos_reason`이 담당한다.
 
 ```python
-def oos_gate(state: RowState) -> Literal["status_oos", "status_unreadable", "canonicalize"]:
+def oos_gate(state: RowState, *, krx: KRXIndex) -> Literal["mark_oos_reason", "status_unreadable", "canonicalize"]:
+    """Routing only — does NOT mutate state."""
     # 0. 추출 실패는 OOS가 아니라 별도 경로
     if state.get("pdf_unreadable") or state.get("llm_refusal"):
         return "status_unreadable"
 
-    raw = state["llm_raw"]
+    raw = state.get("llm_raw")
+    if raw is None:
+        return "status_unreadable"
+
     sig = raw.oos_signals
 
-    # 1. OOS 패턴 (자동 결정)
-    if sig.foreign_ticker_seen: state["oos_reason"] = "foreign"; return "status_oos"
-    if sig.etf_or_fund:         state["oos_reason"] = "fund";    return "status_oos"
-    if sig.digital_asset:       state["oos_reason"] = "digital"; return "status_oos"
+    # 1. OOS 신호 (있으면 mark_oos_reason이 사유 결정)
+    if sig.foreign_primary_coverage or sig.etf_or_fund or sig.digital_asset:
+        return "mark_oos_reason"
+
+    # 2. private_company_likely는 §6.5 룰 4 예외 적용
     if sig.private_company_likely:
-        # 원 spec §6.5 룰 4: KRX 매칭 코드 또는 IR자료 후보면 in-scope 유지
+        # KRX 매칭 코드 1개 이상 → in-scope (룰 4 첫째)
+        if any(krx.validate_code(c) for c in raw.stock_codes_raw):
+            return "canonicalize"
+        # IR자료 후보 → in-scope (룰 4 셋째: 자체 IR은 OOS private 아님)
         if raw.report_type == "IR자료":
             return "canonicalize"
-        if any(KRX.validate_code(c) for c in raw.stock_codes_raw):
+        # IPO 후보 + KRX 미매칭 → in-scope IPO 유지 (룰 4 둘째)
+        if raw.report_type == "IPO":
             return "canonicalize"
-        state["oos_reason"] = "private"
-        return "status_oos"
+        return "mark_oos_reason"
 
     return "canonicalize"
 ```
 
+#### 8.3.1 `mark_oos_reason` 노드
+
+`oos_gate`가 `"mark_oos_reason"`을 반환하면 이 노드가 정확한 `oos_reason`을 결정·기록 후 `status_oos`로 진입.
+
+```python
+def mark_oos_reason(state: RowState) -> dict:
+    sig = state["llm_raw"].oos_signals
+    if sig.foreign_primary_coverage:
+        return {"is_oos": True, "oos_reason": "foreign"}
+    if sig.etf_or_fund:
+        return {"is_oos": True, "oos_reason": "fund"}
+    if sig.digital_asset:
+        return {"is_oos": True, "oos_reason": "digital"}
+    # 여기 도달 = private_company_likely (룰 4 예외 모두 false 통과)
+    return {"is_oos": True, "oos_reason": "private"}
+```
+
 LangGraph `add_conditional_edges`에 3-way 매핑:
 ```python
-g.add_conditional_edges("llm_extract", oos_gate, {
-    "status_oos":        "status_oos",
+g.add_conditional_edges("llm_extract", partial(oos_gate, krx=KRX), {
+    "mark_oos_reason":   "mark_oos_reason",
     "status_unreadable": "status_unreadable",
     "canonicalize":      "canonicalize",
 })
+g.add_edge("mark_oos_reason", "status_oos")
 ```
 
 ### 8.4 `status_oos`
@@ -626,10 +657,20 @@ def validate(state: RowState) -> dict:
     smajor_valid, sminor_valid, s_unknown = [], [], []
     for s in raw.sectors_major:
         m = KRX.fuzzy_sector_match(s)
-        (smajor_valid if m and m in KRX.sectors_major else s_unknown).append(m or s)
+        if m and m in KRX.sectors_major: smajor_valid.append(m)
+        else:                            s_unknown.append(s)
     for s in raw.sectors_minor:
         m = KRX.fuzzy_sector_match(s)
-        (sminor_valid if m and m in KRX.sectors_minor else s_unknown).append(m or s)
+        if m and m in KRX.sectors_minor: sminor_valid.append(m)
+        else:                            s_unknown.append(s)
+
+    # products: KRX substring 멤버십 검증 (원 spec §6.6 정책 — silent drop 안 함)
+    products_valid, products_unknown = [], []
+    for p in raw.products:
+        if any(p in e.products_text for e in KRX.by_code.values()):
+            products_valid.append(p)
+        else:
+            products_unknown.append(p)
 
     return {
         "stock_codes_valid": valid_codes,
@@ -637,10 +678,12 @@ def validate(state: RowState) -> dict:
         "sectors_major_valid": smajor_valid,
         "sectors_minor_valid": sminor_valid,
         "sectors_unknown": s_unknown,
+        "products_valid": products_valid,
+        "products_unknown": products_unknown,
     }
 ```
 
-`unknown_codes`/`sectors_unknown`이 비지 않았는데 OOS 패턴도 아니면 decide_status에서 review_needed/low 트리거.
+`unknown_codes`/`sectors_unknown`/`products_unknown`이 비지 않았는데 OOS 패턴도 아니면 decide_status에서 `review_needed/low` 트리거 (원 spec §6.6 정책).
 
 ### 8.7 `enrich`
 
@@ -650,7 +693,7 @@ def enrich(state: RowState) -> dict:
     company_names = list(raw.company_names)
     sectors_major = list(state["sectors_major_valid"])
     sectors_minor = list(state["sectors_minor_valid"])
-    products = list(raw.products)
+    products = list(state["products_valid"])  # validate가 KRX 멤버십 검증한 결과만 입력
 
     # 단일종목/IR/IPO + KRX 매칭 → 자동 보강
     if raw.report_type in ("단일종목","IR자료","IPO"):
@@ -666,7 +709,7 @@ def enrich(state: RowState) -> dict:
                 if tok not in products: products.append(tok)
 
     # 산업 깊이 합류: products → minor/major, minor → major (원 spec §6.3)
-    products = KRX.filter_products_by_membership(products)  # §3.d 필터 (substring 멤버십)
+    # validate가 이미 substring 멤버십 검증함. 여기서 다시 필터링 안 함.
     for p in products:
         for entry in KRX.rows_with_product(p):
             if entry.sector_minor and entry.sector_minor not in sectors_minor:
@@ -696,7 +739,7 @@ def enrich(state: RowState) -> dict:
     }
 ```
 
-products 필터링 (원 spec §3.d): LLM이 뱉은 product 토큰이 KRX CSV의 어떤 row의 `주요제품` 셀에든 substring으로 등장해야 채택. 등장 안 하면 버림 (`unknown_product` 미발생, review_needed 아님).
+products 필터링 (원 spec §3.d/§6.6): LLM이 뱉은 product 토큰이 KRX CSV의 어떤 row의 `주요제품` 셀에든 substring으로 등장해야 `products_valid`에 채택. 등장 안 하면 `products_unknown`에 들어가 decide_status가 `review_needed/low/notes='unknown_product:<value>'`로 처리. silent drop 안 함 — 원 spec §6.6 정책 보존.
 
 ### 8.8 `decide_status`
 
@@ -704,7 +747,7 @@ products 필터링 (원 spec §3.d): LLM이 뱉은 product 토큰이 KRX CSV의 
 
 ```python
 def decide_status(state: RowState) -> dict:
-    # 0. 가독 실패 케이스 (oos_gate 직전 분기로 들어왔을 때)
+    # 0. 가독 실패 케이스
     if state.get("pdf_unreadable"):
         return {"tagging_status":"review_needed", "tagging_confidence":"low",
                 "tagging_notes":"first_page_unreadable"}
@@ -712,35 +755,43 @@ def decide_status(state: RowState) -> dict:
         return {"tagging_status":"review_needed", "tagging_confidence":"low",
                 "tagging_notes": f"llm_refusal:{state['llm_refusal']}"}
 
-    # 1. report_type 추출 불가 = '기타' + LLM의 self_confidence='low' 동시 → type_indeterminate
     notes: list[str] = []
-    raw = state["llm_raw"]
-    if raw.report_type == "기타" and raw.self_confidence == "low" and not state.get("is_oos"):
+    raw = state.get("llm_raw")
+
+    # 1. type_indeterminate (in-scope만)
+    if (raw is not None and raw.report_type == "기타"
+            and raw.self_confidence == "low" and not state.get("is_oos")):
         notes.append("type_indeterminate")
 
-    # 2. 검증 실패 수집
-    if state.get("stock_codes_unknown") and not state.get("is_oos"):
-        notes.append("unknown_stock_code:" + ",".join(state["stock_codes_unknown"]))
-    if state.get("sectors_unknown") and not state.get("is_oos"):
-        notes.append("unknown_sector:" + ",".join(state["sectors_unknown"]))
+    # 2. 검증 실패 수집 (in-scope만) — 원 spec §6.6 정책:
+    #    unknown_stock_code / unknown_sector / unknown_product / unknown_publisher
+    #    네 개 모두 review_needed/low 트리거.
+    if not state.get("is_oos"):
+        if state.get("stock_codes_unknown"):
+            notes.append("unknown_stock_code:" + ",".join(state["stock_codes_unknown"]))
+        if state.get("sectors_unknown"):
+            notes.append("unknown_sector:" + ",".join(state["sectors_unknown"]))
+        if state.get("products_unknown"):
+            notes.append("unknown_product:" + ",".join(state["products_unknown"]))
+        if state.get("publisher_canon") is None and raw is not None and raw.publisher_raw:
+            notes.append(f"unknown_publisher:{raw.publisher_raw}")
 
     has_validation_failure = any(
-        n.startswith(("unknown_stock_code:","unknown_sector:","type_indeterminate"))
+        n.startswith(("unknown_stock_code:", "unknown_sector:",
+                      "unknown_product:", "unknown_publisher:",
+                      "type_indeterminate"))
         for n in notes
     )
     if has_validation_failure:
         return {"tagging_status":"review_needed", "tagging_confidence":"low",
                 "tagging_notes":";".join(notes)}
 
-    # 3. auto 케이스. confidence는 폴백·새 토픽·페이지 폴백·publisher 미매핑으로 결정
+    # 3. auto 케이스 — confidence는 폴백·페이지 fallback·새 토픽으로 결정
     used_fallback = (
         state.get("used_sent_at_fallback")
         or bool(state.get("topic_unmapped"))
-        or state.get("publisher_canon") is None
-        or len(state.get("pages_used", [1])) > 1
+        or len(state.get("pages_used") or [1]) > 1
     )
-    if state.get("publisher_canon") is None and raw.publisher_raw:
-        notes.append(f"unknown_publisher:{raw.publisher_raw}")
 
     return {
         "tagging_status": "auto",
@@ -749,7 +800,7 @@ def decide_status(state: RowState) -> dict:
     }
 ```
 
-이 함수 한 개가 원 spec §6.6의 모든 분기를 표현. **단위 테스트로 LLM 호출 0회로 모든 케이스를 커버**할 수 있음 (test_decide_status.py).
+이 함수 한 개가 원 spec §6.6의 모든 분기를 표현. **단위 테스트로 LLM 호출 0회로 모든 케이스를 커버**할 수 있음 (test_decide_status.py). 정책: `unknown_stock_code`/`unknown_sector`/`unknown_product`/`unknown_publisher` 모두 `review_needed/low` (원 spec 2026-05-07 §6.6 그대로).
 
 ### 8.9 `write`
 
@@ -816,7 +867,7 @@ STALE_LOCK_RECLAIM_SQL = """
 UPDATE reports
    SET tagging_status='pending', tagging_locked_at=NULL, tagging_worker_id=NULL
  WHERE tagging_status='processing'
-   AND tagging_locked_at < now() - interval '30 minutes'
+   AND tagging_locked_at < now() - ($1::int * interval '1 minute')
 """
 
 ATOMIC_CLAIM_SQL = """
@@ -898,6 +949,10 @@ SELECT 'oos:'||COALESCE(out_of_scope_reason,'none'), count(*)
 
 ```python
 # orchestrator.py
+LOCK_TTL_MINUTES = 30           # stale lock 회수 임계 (env LOCK_TTL_MINUTES로 override)
+PER_ROW_DEADLINE_S = 90         # 한 row 처리에 허용되는 최대 시간 (env PER_ROW_DEADLINE_S)
+HEARTBEAT_INTERVAL_S = 30       # 처리 중 worker가 tagging_locked_at를 갱신하는 주기
+
 async def run_batch(*, batch_size, mode, dry_run, row_ids, model,
                     max_concurrent_llm=10):
     sb = SupabaseSQL.from_env()
@@ -905,7 +960,7 @@ async def run_batch(*, batch_size, mode, dry_run, row_ids, model,
     worker_id = f"{socket.gethostname()}-{os.getpid()}-{secrets.token_hex(2)}"
 
     if not row_ids and not dry_run:
-        await sb.execute(STALE_LOCK_RECLAIM_SQL)
+        await sb.execute(STALE_LOCK_RECLAIM_SQL, [LOCK_TTL_MINUTES])
 
     if row_ids:
         rows = await sb.fetch(ROW_IDS_FETCH_SQL, [row_ids])
@@ -923,25 +978,43 @@ async def run_batch(*, batch_size, mode, dry_run, row_ids, model,
         async with sem:
             init_state = {**row, "worker_id": worker_id, "model": model}
             try:
-                return await app.ainvoke(init_state)
+                # per-row deadline. timeout이면 row를 pending으로 되돌림 (정상 stale-lock 회수와 동일).
+                final = await asyncio.wait_for(app.ainvoke(init_state), timeout=PER_ROW_DEADLINE_S)
+                return {"id": row["id"], **final}
             except OpenAITransientError as e:
                 if not dry_run and not row_ids:
                     await sb.execute(REVERT_TO_PENDING_SQL, [row["id"]])
                 return {"id": row["id"], "error": "transient", "detail": str(e)}
+            except asyncio.TimeoutError:
+                if not dry_run and not row_ids:
+                    await sb.execute(REVERT_TO_PENDING_SQL, [row["id"]])
+                return {"id": row["id"], "error": "deadline_exceeded"}
+            except Exception as e:
+                # 알 수 없는 예외: row를 pending으로 두고(다음 실행에서 재시도) 보고에 기록.
+                # (write 단계가 일부만 진행됐다면 stale-lock 회수가 LOCK_TTL_MINUTES 후 복구.)
+                if not dry_run and not row_ids:
+                    await sb.execute(REVERT_TO_PENDING_SQL, [row["id"]])
+                return {"id": row["id"], "error": "unhandled",
+                        "detail": f"{type(e).__name__}:{e}"}
 
     results = await asyncio.gather(*[_process(r) for r in rows])
     return _aggregate_report(results, dry_run=dry_run)
 ```
 
+**heartbeat (선택)**: per-row deadline이 짧으면 (예: PDF가 큰 경우) 워커가 처리 중 `tagging_locked_at = now()`를 주기적으로 갱신해 stale-lock 회수가 잘못 작동하는 것을 막는다. 구현은 `extract_pdf` 직후 `asyncio.create_task(_heartbeat(sb, row_id, HEARTBEAT_INTERVAL_S))`로 시작 후 `write` 진입 시 cancel. 본 spec에서는 옵션 (`HEARTBEAT_ENABLED=false` 기본값) — `LOCK_TTL_MINUTES > PER_ROW_DEADLINE_S/60` 보장하면 보통 불필요.
+
 ### 9.3 에러 처리 / 재시도
 
 | 실패 종류 | 처리 |
 |---|---|
-| OpenAI 429 / 5xx / 타임아웃 | `OpenAITransientError` → row를 pending 되돌림. 다음 실행에서 자동 재시도. SDK는 자체 `max_retries=2`로 1차 흡수. |
-| OpenAI refusal | `review_needed/low/notes='llm_refusal:<reason>'`로 정상 write. row 영속화. |
-| Pydantic 파싱 실패 (parse() 예외) | transient 취급 → pending 되돌림. (다른 모델로 재시도 가능) |
-| PyMuPDF 예외 (PDF 손상) | `pdf_unreadable=True` → `status_unreadable` 노드 → `review_needed/low/first_page_unreadable`로 write. 영속화 (다음 호출에서 같은 결과 — 사람 검토 필요). |
-| Supabase write 실패 | orchestrator에서 transient 취급. row가 `processing`으로 남아 다음 실행의 stale lock 회수가 30분 후 복구. |
+| OpenAI 429 / 5xx / 타임아웃 | `OpenAITransientError` → REVERT to pending. SDK 자체 `max_retries=2`로 1차 흡수, 그래도 실패하면 위 처리. |
+| OpenAI refusal | `review_needed/low/notes='llm_refusal:<reason>'`로 정상 write. |
+| Pydantic 파싱 실패 (`parse()` 예외) | `OpenAITransientError`로 wrapping → REVERT to pending. 다른 모델로 escalation 가능. |
+| PyMuPDF 예외 (PDF 손상) | `pdf_unreadable=True` → `status_unreadable` 노드 → `review_needed/low/first_page_unreadable`로 write. |
+| asyncio per-row timeout | `PER_ROW_DEADLINE_S` 초과 → REVERT to pending, `error='deadline_exceeded'`로 보고. |
+| 알 수 없는 예외 (네트워크 일시 끊김, asyncpg 일시 오류, 노드 코드 버그) | broad except → REVERT to pending, `error='unhandled'`로 보고. row가 영구적으로 처리 안 되는 것 방지. |
+| Supabase write 실패 (REVERT까지 실패) | row가 `processing`으로 남음. 다음 실행의 stale-lock 회수가 `LOCK_TTL_MINUTES` 후 복구. |
+| `asyncio.gather` 자체 폭주 | broad except로 모두 격리되므로 `gather`는 raise 안 함 (return_exceptions 효과). |
 
 `row_ids` 모드에서는 `REVERT_TO_PENDING`을 호출하지 않음 — 사용자가 명시한 ID는 status를 건드리지 않는다는 원 spec 룰 준수.
 
@@ -961,19 +1034,28 @@ TAGGER_BATCH_SIZE_DEFAULT=10
 KRX_CSV_PATH=docs/stock_data/KRX_stocks_data.csv
 TAGGER_VERSION=langgraph-tagger@1.0
 
+# Concurrency / safety knobs
+LOCK_TTL_MINUTES=30
+PER_ROW_DEADLINE_S=90
+HEARTBEAT_INTERVAL_S=30
+HEARTBEAT_ENABLED=false
+
 # 기존 (재사용): SUPABASE_URL, SUPABASE_SERVICE_KEY, STORAGE_BASE_DIR
 ```
 
-### 9.5 동시성 한계
+### 9.5 동시성 한계 + lock 운영
 
-| 제약 | Semaphore 영향 |
+| 제약 | 영향 / 대응 |
 |---|---|
 | OpenAI RPM (tier별) | 초과 시 429. SDK 재시도가 1차 흡수. 보수적으로 시작 → 모니터링 후 증대. |
 | OpenAI TPM | row당 입력 ≈ 1.5–3K + 출력 ≈ 0.5K = ~3K. TPM 200K면 동시 ~60 row가 한계. |
 | Supabase 동시 UPDATE | row 단위 UPDATE라 충돌 없음 (atomic claim으로 row 분리됨). |
 | PyMuPDF (sync) | `asyncio.to_thread`로 wrapping. 이벤트 루프 안 막음. |
+| **per-row deadline** | `PER_ROW_DEADLINE_S` (기본 90초). 초과 시 row를 pending으로 되돌림. PDF 손상·OpenAI 행거·extract 무한루프 방지. |
+| **lock TTL** | `LOCK_TTL_MINUTES` (기본 30분). `tagging_locked_at < now() - LOCK_TTL_MINUTES`인 `processing` row를 stale로 보고 회수. **`LOCK_TTL_MINUTES * 60 > PER_ROW_DEADLINE_S`** 보장 (그 사이 정상 처리가 끝날 시간을 줘야 stale 회수가 살아있는 워커를 방해하지 않음). |
+| **heartbeat (선택)** | `HEARTBEAT_ENABLED=true`이면 워커가 처리 중 `tagging_locked_at = now()`를 `HEARTBEAT_INTERVAL_S`마다 갱신. PDF가 매우 큰 경우 (`PER_ROW_DEADLINE_S`를 길게 잡아야 할 때) lock TTL 안 늘리면서 stale 오작동 방지. 일상 batch에는 불필요. |
 
-기본 `MAX_CONCURRENT_LLM=10`. 실패율 보면서 조정.
+기본 `MAX_CONCURRENT_LLM=10`. 실패율·지연 보면서 조정.
 
 ### 9.6 테스트 전략
 
@@ -986,7 +1068,8 @@ tests/
 ├── test_validate.py       # KRX 검증, 정규식, fuzzy sector
 ├── test_enrich.py         # 산업 합류 (대⊃중⊃제품), 단일종목 자동 보강, sent_at 폴백
 ├── test_decide_status.py  # 원 spec §6.6 결정 트리 모든 분기 (parametrize)
-├── test_orchestrator.py   # 동시성, atomic claim 시뮬, 에러 처리, dry_run/row_ids
+├── test_orchestrator.py   # 동시성, atomic claim 시뮬, broad exception 처리, deadline, dry_run/row_ids
+├── test_parity.py         # NEW: friendly-mclaren skill 결과 JSON과 본 구현 출력 비교 (regression)
 └── golden/
     ├── single_stock_*.pdf
     ├── industry_*.pdf
@@ -996,23 +1079,27 @@ tests/
     ├── quant.pdf
     ├── theme.pdf
     ├── ipo_listing.pdf
-    ├── ipo_unlisted.pdf       # KRX 미매칭 IPO (in-scope 유지)
+    ├── ipo_unlisted.pdf            # KRX 미매칭 IPO (in-scope 유지) — §6.5 룰 4
     ├── esg.pdf
     ├── reit.pdf
     ├── derivative.pdf
     ├── credit.pdf
-    ├── ir_company_self.pdf    # private 경계 → in-scope
+    ├── ir_company_self.pdf         # private 경계 → in-scope
     ├── etc_in_scope.pdf
-    ├── foreign_us_stock.pdf   # OOS foreign
-    ├── etf_lineup.pdf         # OOS fund
-    ├── digital_btc.pdf        # OOS digital
-    └── private_unlisted.pdf   # OOS private
+    ├── foreign_primary.pdf         # OOS foreign (해외 단일종목 분석)
+    ├── domestic_with_foreign_peer.pdf  # NEW: 국내 단일종목 + AAPL/NVDA peer 언급 → in-scope
+    ├── etf_lineup.pdf              # OOS fund
+    ├── digital_btc.pdf             # OOS digital
+    ├── private_unlisted.pdf        # OOS private
+    ├── unknown_publisher_in_scope.pdf  # NEW: vocab에 없는 broker → review_needed/low
+    └── unknown_product_in_scope.pdf    # NEW: KRX 도메인 외 product → review_needed/low
 ```
 
 핵심:
 - `test_decide_status.py`: 원 spec §6.6의 모든 분기를 input → expected output 케이스로 parametrize. **LLM 호출 0회**로 결정 트리 검증. 사용자 우려("코드가 LLM을 완전 대체하는 게 안전한지")의 직접 답.
-- `test_orchestrator.py`: `mock_openai_returning(LLMExtraction(...))` fixture로 그래프 전체를 LLM 호출 없이 검증. atomic claim race도 두 워커 병행 시뮬.
-- golden PDFs: 14 type + 4 OOS (총 18+) 케이스. friendly-mclaren의 evals와 동일 PDF 사용 가능 (`docs/stock_data` 또는 평가용 별도 폴더).
+- `test_orchestrator.py`: `mock_openai_returning(LLMExtraction(...))` fixture로 그래프 전체를 LLM 호출 없이 검증. atomic claim race, per-row deadline timeout, broad exception, dry_run/row_ids 모두 케이스화.
+- **`test_parity.py` (신규)**: friendly-mclaren의 evals workspace에 적재된 result.json과 본 구현 출력을 비교하는 regression. "결과 동일성 100% 보존"의 자동 검증. 가용한 result.json이 없는 fields는 사람이 6~10개 대표 케이스를 fixture로 고정.
+- golden PDFs: 14 type + 4 OOS + 5 경계 케이스. friendly-mclaren의 evals와 동일 PDF 사용 가능.
 
 ### 9.7 운영 보고
 
@@ -1026,12 +1113,46 @@ review_needed reasons:
   - first_page_unreadable: 2
   - type_indeterminate: 2
   - llm_refusal: 1
-unknown_publisher (auto/medium): 4 (IRKUDOS×2, GL Research×2)
+  - unknown_publisher: 2 (IRKUDOS, NewBoutique)
+  - unknown_product: 1
 duration: 47.3s
 cost (estimated): input=$0.X, output=$0.Y, total=$0.Z
 ```
 
 cost 추정은 OpenAI completion 응답의 `usage.prompt_tokens` / `usage.completion_tokens`를 누적해서 환산.
+
+#### 9.7.1 unknown publisher / product 정기 보강 흐름
+
+`unknown_publisher`/`unknown_product`는 `review_needed/low`로 빠지므로 vocabulary 보강 후 일괄 재처리가 정상 흐름이다.
+
+```sql
+-- 최근 7일 미등록 publisher 상위 (PR로 publishers.yaml에 추가할 후보)
+SELECT split_part(tagging_notes, ':', 2) AS unknown_pub, count(*)
+  FROM reports
+ WHERE tagging_notes LIKE 'unknown_publisher:%'
+   AND tagged_at >= now() - interval '7 days'
+ GROUP BY 1
+ ORDER BY 2 DESC;
+
+-- 최근 7일 미등록 product 상위
+SELECT split_part(tagging_notes, ':', 2) AS unknown_prod, count(*)
+  FROM reports
+ WHERE tagging_notes LIKE 'unknown_product:%'
+   AND tagged_at >= now() - interval '7 days'
+ GROUP BY 1
+ ORDER BY 2 DESC;
+```
+
+위 결과로 `publishers.yaml` PR 또는 KRX CSV 갱신 후, 해당 row들을 `pending`으로 되돌려 재처리:
+
+```sql
+UPDATE reports
+   SET tagging_status='pending', tagging_notes=NULL,
+       tagging_confidence=NULL, tagging_locked_at=NULL, tagging_worker_id=NULL
+ WHERE tagging_notes LIKE 'unknown_publisher:NewBroker%';
+```
+
+> **analysts는 vocabulary 매핑 없음** (Option γ): LLM이 추출한 raw 이름을 `analysts text[]`에 그대로 기록. 새 애널리스트 등장 빈도가 매우 높고 vocabulary 유지 비용이 publisher 대비 큼. 검색은 GIN 인덱스로 충분. `analysts` 부재는 `confidence='medium'` 정도로만 영향 (review_needed 아님).
 
 ## 10. 의존성
 
@@ -1057,9 +1178,12 @@ pydantic>=2.7
 | §3.a `first_page_unreadable` (가독 실패) | §8.4.1 `status_unreadable` (oos_gate에서 별도 분기) |
 | §3.b 후보 필드 추출 | §7.2 `LLMExtraction` + §8.2 `llm_extract` (1회 호출) |
 | §3.b `llm_refusal` 처리 | §8.4.1 `status_unreadable` |
-| §3.c OOS 우선 판정 | §8.3 `oos_gate` + §8.4 `status_oos` |
-| §3.d Canonical 정규화 (publisher/topics/products) | §8.5 `canonicalize` (publisher/topics) + §8.7 `enrich` (products substring via `KRX.filter_products_by_membership`) |
+| §3.c OOS 우선 판정 | §8.3 `oos_gate` (routing-only) + §8.3.1 `mark_oos_reason` + §8.4 `status_oos` |
+| §3.d Canonical 정규화 (publisher/topics/products) | §8.5 `canonicalize` (publisher/topics) + §8.6 `validate` (products KRX 멤버십) |
 | §3.e CSV 검증 + 산업 깊이 | §8.6 `validate` + §8.7 `enrich` (`rows_with_product`/`rows_with_sector_minor`) |
+| §6.5 룰 4 IPO 경계 (KRX 미매칭 IPO in-scope) | §8.3 `oos_gate`의 private 분기 (IR자료 / KRX 매칭 / IPO 후보 모두 in-scope 유지) |
+| §6.6 `unknown_publisher` → review_needed/low | §8.8 `decide_status` (코드 정책) — 원 spec 정책 보존 |
+| §6.6 `unknown_product` → review_needed/low | §8.6 `validate` (products_unknown 분리) + §8.8 `decide_status` |
 | §3.f status/confidence 결정 | §8.8 `decide_status` |
 | §3.g UPDATE row | §8.9 `write` + §9.1 `UPDATE_SQL` |
 | §6.5 precedence rule | §8.2 SYSTEM_PROMPT (LLM 분류 시) + §8.3 oos_gate (룰 4) + §8.7 enrich (자동 보강) |
@@ -1093,6 +1217,7 @@ pydantic>=2.7
 8. publishers.yaml / topics.yaml vocabulary 보강
 9. 큰 backfill (`--batch-size 100`)
 10. 1pass 끝 후 `escalate --since ...`로 review_needed만 gpt-5.4 재처리
+11. 주기적 vocabulary 보강 흐름 (§9.7.1): unknown_publisher/unknown_product 분포 쿼리 → 결과를 보고 publishers.yaml PR / KRX CSV 갱신 → 해당 row를 pending으로 일괄 되돌려 재처리. analysts는 vocabulary 매핑 없이 raw 기록되므로 별도 보강 불필요 (Option γ).
 
 ## 14. brainstorming → 구현 분기
 

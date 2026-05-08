@@ -262,6 +262,14 @@ KRX_CSV_PATH=docs/stock_data/KRX_stocks_data.csv
 # for atomic claim / stale lock / UPDATE via asyncpg). Get it from
 # Supabase project settings → Database → Connection string (URI).
 SUPABASE_DB_URL=postgresql://postgres:<pw>@<host>:5432/postgres
+
+# Concurrency / lock safety knobs (spec §9.5)
+# LOCK_TTL_MINUTES * 60 must be > PER_ROW_DEADLINE_S so stale-lock reclaim
+# never races a still-running worker.
+LOCK_TTL_MINUTES=30
+PER_ROW_DEADLINE_S=90
+HEARTBEAT_ENABLED=false
+HEARTBEAT_INTERVAL_S=30
 ```
 
 - [ ] **Step 4: Install deps**
@@ -1057,12 +1065,21 @@ class KRXIndex:
         return self.by_code.get(code)
 
     def split_products(self, products_text: str) -> list[str]:
-        """ "MLCC, 기판, 카메라 모듈 등" → ['MLCC', '기판', '카메라 모듈'] """
-        out = []
+        """ "MLCC, 기판, 카메라 모듈 등" → ['MLCC', '기판', '카메라 모듈']
+            "DRAM, NAND 등"           → ['DRAM', 'NAND']
+
+        Trailing ' 등' 접미사도 제거해야 한다 — KRX CSV에서 마지막 토큰이
+        "X 등" 형태인 경우가 빈번 (예: "DRAM, NAND 등").
+        """
+        out: list[str] = []
         for token in products_text.split(","):
             t = token.strip()
-            if t and t != "등":
-                out.append(t)
+            # Strip trailing ' 등' suffix (with leading space)
+            if t.endswith(" 등"):
+                t = t[:-2].strip()
+            if not t or t == "등":
+                continue
+            out.append(t)
         return out
 
     def fuzzy_sector_match(self, value: str) -> Optional[str]:
@@ -1256,18 +1273,25 @@ REPORT_TYPES = Literal[
 
 
 class OOSSignals(BaseModel):
-    """LLM-observed out-of-scope patterns. Code re-validates before final OOS marking."""
-    foreign_ticker_seen: bool = Field(
-        description="외국 티커 (DG, NFLX, AAPL, BABA …) 또는 '해외주식' 명시"
+    """LLM-observed primary-coverage signals. Code re-validates before final OOS marking.
+
+    중요: 'primary coverage'를 강조해 국내 단일종목/산업 리포트가 AAPL/NVDA/TSMC 같은
+    해외 peer를 단순 언급하는 경우는 false로 표시해야 한다.
+    """
+    foreign_primary_coverage: bool = Field(
+        description="**리포트의 primary coverage가 해외 상장사**일 때만 true. "
+                    "국내 종목/산업 리포트가 외국 티커를 peer/벨류체인/수요처로 "
+                    "단순 언급하는 경우는 false."
     )
     etf_or_fund: bool = Field(
-        description="ETF 라인업 / 펀드평가 / 펀드비교"
+        description="ETF 라인업 / 펀드평가 / 펀드비교 (primary coverage가 펀드/ETF)"
     )
     digital_asset: bool = Field(
-        description="가상자산·디지털자산·BTC·ETH·코인"
+        description="가상자산·디지털자산·BTC·ETH·코인 (primary coverage가 디지털자산)"
     )
     private_company_likely: bool = Field(
-        description="KRX 미등록 + 명백한 비상장/장외 컨텍스트. 자체 IR이면 false로 표시."
+        description="KRX 미등록 + 명백한 비상장/장외 컨텍스트. 자체 IR이면 false. "
+                    "공모·IPO·상장예정 컨텍스트(KRX 미매칭이지만 in-scope IPO 후보)도 false."
     )
 
 
@@ -1388,14 +1412,20 @@ SYSTEM_PROMPT = f"""너는 한국 주식 리서치 PDF의 첫 페이지(들)를 
 - IR자료: 발행 주체 = 해당기업 자체 (자체 IR 발표자료)
 - 기타: 위에 안 들어가는 것 + OOS (해외/펀드/디지털/비상장)
 
-## OOS 신호 (oos_signals)
+## OOS 신호 (oos_signals) — primary coverage 중심
 
-다음을 발견하면 즉시 그 boolean을 true로:
-- foreign_ticker_seen: DG/NFLX/AAPL/BABA 등 외국 티커, "해외주식" 명시
-- etf_or_fund: ETF 라인업, 펀드평가보고서, 펀드비교
-- digital_asset: BTC/ETH/코인 분석, 디지털자산
+리포트의 **primary coverage**(주된 분석 대상)가 무엇인지를 보고 판단.
+국내 종목/산업 리포트가 외국 종목을 peer·밸류체인·수요처로 단순 언급하는
+경우는 모두 false.
+
+- foreign_primary_coverage: primary coverage가 해외 상장사일 때만 true.
+  - true 예: "Disney(DIS) 1Q26 Preview" / "테슬라 가이던스" / 표지에 외국 티커가 분석 대상으로 명시
+  - false 예: "삼성전자 - AI수혜, 엔비디아 GPU 수요" (primary는 삼성전자, NVDA는 peer)
+- etf_or_fund: primary coverage가 ETF/펀드 (라인업, 평가보고서, 비교)
+- digital_asset: primary coverage가 디지털자산 (BTC/ETH/코인 분석)
 - private_company_likely: KRX 미등록 + 명백한 비상장/장외 컨텍스트.
-  단, 자체 IR(회사 로고 + "Investor Relations")이면 false.
+  - false 예외 1: 자체 IR (회사 로고 + "Investor Relations")
+  - false 예외 2: 공모·IPO·상장예정 컨텍스트 (KRX 미매칭이지만 in-scope IPO)
 
 ## 분류 우선순위 (precedence rules)
 
@@ -1746,7 +1776,7 @@ def make_llm_extraction(**overrides) -> LLMExtraction:
         analysts=["홍길동"],
         topics=["AI수혜"],
         oos_signals=OOSSignals(
-            foreign_ticker_seen=False, etf_or_fund=False,
+            foreign_primary_coverage=False, etf_or_fund=False,
             digital_asset=False, private_company_likely=False,
         ),
         self_confidence="high",
@@ -1921,18 +1951,20 @@ EOF
 
 ---
 
-### Task 10: oos_gate node + tests (TDD)
+### Task 10: oos_gate (routing-only) + mark_oos_reason node + tests (TDD)
 
 **Files:**
-- Create: `langgraph_tagger/nodes/oos_gate.py`
+- Create: `langgraph_tagger/nodes/oos_gate.py` — routing function only (no state mutation; LangGraph 1.0 contract)
+- Create: `langgraph_tagger/nodes/mark_oos_reason.py` — sets `is_oos`/`oos_reason` from LLM signals
 - Create: `langgraph_tagger/tests/test_oos_gate.py`
+- Create: `langgraph_tagger/tests/test_mark_oos_reason.py`
 
-- [ ] **Step 1: Write failing tests**
+- [ ] **Step 1: Write failing tests for oos_gate (routing-only)**
 
 `langgraph_tagger/tests/test_oos_gate.py`:
 
 ```python
-"""Tests for oos_gate (3-way conditional edge)."""
+"""Tests for oos_gate (3-way routing function — does NOT mutate state)."""
 import pytest
 
 from langgraph_tagger.llm_schemas import LLMExtraction, OOSSignals
@@ -1942,7 +1974,7 @@ from langgraph_tagger.tests.conftest import make_llm_extraction
 
 def _ext(**oos_kwargs) -> LLMExtraction:
     sig = OOSSignals(
-        foreign_ticker_seen=oos_kwargs.get("foreign", False),
+        foreign_primary_coverage=oos_kwargs.get("foreign", False),
         etf_or_fund=oos_kwargs.get("etf", False),
         digital_asset=oos_kwargs.get("digital", False),
         private_company_likely=oos_kwargs.get("private", False),
@@ -1954,57 +1986,71 @@ def _ext(**oos_kwargs) -> LLMExtraction:
     )
 
 
-def test_pdf_unreadable_routes_to_status_unreadable(krx, monkeypatch):
+def test_pdf_unreadable_routes_to_status_unreadable(krx):
     state = {"pdf_unreadable": True, "llm_raw": None}
-    assert oos_gate(state) == "status_unreadable"
+    assert oos_gate(state, krx=krx) == "status_unreadable"
+    # state must NOT be mutated
+    assert "oos_reason" not in state
 
 
-def test_llm_refusal_routes_to_status_unreadable():
+def test_llm_refusal_routes_to_status_unreadable(krx):
     state = {"pdf_unreadable": False, "llm_raw": None, "llm_refusal": "policy"}
-    assert oos_gate(state) == "status_unreadable"
+    assert oos_gate(state, krx=krx) == "status_unreadable"
+    assert "oos_reason" not in state
 
 
-def test_foreign_routes_to_oos(krx):
+def test_foreign_routes_to_mark_oos(krx):
     state = {"llm_raw": _ext(foreign=True)}
-    assert oos_gate(state) == "status_oos"
-    assert state["oos_reason"] == "foreign"
+    assert oos_gate(state, krx=krx) == "mark_oos_reason"
+    # routing-only — does NOT set oos_reason here
+    assert "oos_reason" not in state
 
 
-def test_fund_routes_to_oos(krx):
+def test_fund_routes_to_mark_oos(krx):
     state = {"llm_raw": _ext(etf=True)}
-    assert oos_gate(state) == "status_oos"
-    assert state["oos_reason"] == "fund"
+    assert oos_gate(state, krx=krx) == "mark_oos_reason"
 
 
-def test_digital_routes_to_oos(krx):
+def test_digital_routes_to_mark_oos(krx):
     state = {"llm_raw": _ext(digital=True)}
-    assert oos_gate(state) == "status_oos"
-    assert state["oos_reason"] == "digital"
+    assert oos_gate(state, krx=krx) == "mark_oos_reason"
 
 
-def test_private_with_no_krx_match_routes_to_oos(krx):
+def test_private_with_no_krx_match_routes_to_mark_oos(krx):
     state = {"llm_raw": _ext(private=True, stock_codes_raw=["999999"])}
-    assert oos_gate(state) == "status_oos"
-    assert state["oos_reason"] == "private"
+    assert oos_gate(state, krx=krx) == "mark_oos_reason"
 
 
 def test_private_with_krx_match_stays_in_scope(krx):
     # spec §6.5 rule 4: KRX-matched code → in-scope even if private signal is set
     state = {"llm_raw": _ext(private=True, stock_codes_raw=["005930"])}
-    assert oos_gate(state) == "canonicalize"
-    assert state.get("oos_reason") is None
+    assert oos_gate(state, krx=krx) == "canonicalize"
 
 
 def test_private_with_ir_jaryo_stays_in_scope(krx):
     # spec §6.5 rule 4: publisher_type=company (자체 IR) is in-scope IR자료
     state = {"llm_raw": _ext(private=True, report_type="IR자료")}
-    assert oos_gate(state) == "canonicalize"
+    assert oos_gate(state, krx=krx) == "canonicalize"
+
+
+def test_private_with_ipo_unmatched_stays_in_scope(krx):
+    # spec §6.5 rule 4 second case: KRX-unmatched but public-offer/IPO context → in-scope IPO
+    state = {"llm_raw": _ext(private=True, report_type="IPO")}
+    assert oos_gate(state, krx=krx) == "canonicalize"
 
 
 def test_in_scope_default_routes_to_canonicalize(krx):
     state = {"llm_raw": _ext()}
-    assert oos_gate(state) == "canonicalize"
-    assert state.get("oos_reason") is None
+    assert oos_gate(state, krx=krx) == "canonicalize"
+
+
+def test_routing_function_does_not_mutate_state_in_any_branch(krx):
+    """Defense-in-depth: snapshot before/after to confirm no mutation."""
+    import copy
+    state = {"llm_raw": _ext(foreign=True)}
+    snapshot = copy.deepcopy(state)
+    oos_gate(state, krx=krx)
+    assert state == snapshot
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -2017,16 +2063,20 @@ Run:
 
 Expected: FAIL on import.
 
-- [ ] **Step 3: Implement oos_gate.py**
+- [ ] **Step 3: Implement oos_gate.py (routing-only)**
 
 `langgraph_tagger/nodes/oos_gate.py`:
 
 ```python
-"""oos_gate: 3-way conditional edge router.
+"""oos_gate: 3-way LangGraph routing function.
+
+LangGraph 1.0 contract: routing functions for ``add_conditional_edges`` MUST
+return a string label only and MUST NOT mutate state. State mutation for OOS
+classification lives in the separate ``mark_oos_reason`` node.
 
 Routes to one of:
   - status_unreadable  (pdf_unreadable or llm_refusal)
-  - status_oos         (one of 4 OOS patterns; sets state['oos_reason'])
+  - mark_oos_reason    (one of 4 OOS patterns; reason decided in next node)
   - canonicalize       (in-scope; downstream lookup/validate/enrich/decide)
 """
 from __future__ import annotations
@@ -2037,74 +2087,144 @@ from langgraph_tagger.state import RowState
 from langgraph_tagger.vocabulary.krx import KRXIndex
 
 
-def oos_gate(state: RowState, *, krx: KRXIndex) -> Literal["status_oos", "status_unreadable", "canonicalize"]:
+def oos_gate(state: RowState, *, krx: KRXIndex) -> Literal[
+    "mark_oos_reason", "status_unreadable", "canonicalize"
+]:
     if state.get("pdf_unreadable") or state.get("llm_refusal"):
         return "status_unreadable"
 
-    raw = state["llm_raw"]
+    raw = state.get("llm_raw")
     if raw is None:
-        # llm_extract returned llm_raw=None for some other reason — treat as unreadable
         return "status_unreadable"
 
     sig = raw.oos_signals
-    if sig.foreign_ticker_seen:
-        state["oos_reason"] = "foreign"
-        return "status_oos"
-    if sig.etf_or_fund:
-        state["oos_reason"] = "fund"
-        return "status_oos"
-    if sig.digital_asset:
-        state["oos_reason"] = "digital"
-        return "status_oos"
+    if sig.foreign_primary_coverage or sig.etf_or_fund or sig.digital_asset:
+        return "mark_oos_reason"
+
     if sig.private_company_likely:
-        # spec §6.5 rule 4: KRX-matched OR IR자료 → in-scope
-        if raw.report_type == "IR자료":
-            return "canonicalize"
+        # spec §6.5 rule 4 — KRX matched or IR자료 or IPO context all stay in-scope
         if any(krx.validate_code(c) for c in raw.stock_codes_raw):
             return "canonicalize"
-        state["oos_reason"] = "private"
-        return "status_oos"
+        if raw.report_type == "IR자료":
+            return "canonicalize"
+        if raw.report_type == "IPO":
+            return "canonicalize"
+        return "mark_oos_reason"
 
     return "canonicalize"
 ```
 
-> Note: tests pass `krx` via fixture, but `oos_gate(state, *, krx=...)` requires the kwarg. The graph assembly later wires it via `partial(oos_gate, krx=KRX)`. For the test signatures above, the `krx` fixture is unused param at the function level — adjust if needed:
+- [ ] **Step 4: Run oos_gate tests**
 
-Edit the test file to call `oos_gate(state, krx=krx)`:
-
-```python
-# Replace each `oos_gate(state)` call in test_oos_gate.py with:
-def test_foreign_routes_to_oos(krx):
-    state = {"llm_raw": _ext(foreign=True)}
-    assert oos_gate(state, krx=krx) == "status_oos"
-    assert state["oos_reason"] == "foreign"
-
-# ... and so on for every test. Update all 9 calls.
-```
-
-- [ ] **Step 4: Update all test calls to pass krx**
-
-Edit `langgraph_tagger/tests/test_oos_gate.py`: change every `oos_gate(state)` to `oos_gate(state, krx=krx)`. (The fixtures that don't use `krx` should be updated to receive the fixture: `def test_pdf_unreadable_routes_to_status_unreadable(krx):` etc.)
-
-After editing, run:
+Run:
 
 ```powershell
 .venv\Scripts\pytest langgraph_tagger/tests/test_oos_gate.py -v
 ```
 
-Expected: 9 tests PASS.
+Expected: 11 tests PASS.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 5: Write failing tests for mark_oos_reason**
+
+`langgraph_tagger/tests/test_mark_oos_reason.py`:
+
+```python
+"""Tests for mark_oos_reason node."""
+from langgraph_tagger.llm_schemas import OOSSignals
+from langgraph_tagger.nodes.mark_oos_reason import mark_oos_reason
+from langgraph_tagger.tests.conftest import make_llm_extraction
+
+
+def _state(**flags):
+    sig = OOSSignals(
+        foreign_primary_coverage=flags.get("foreign", False),
+        etf_or_fund=flags.get("etf", False),
+        digital_asset=flags.get("digital", False),
+        private_company_likely=flags.get("private", False),
+    )
+    return {"llm_raw": make_llm_extraction(oos_signals=sig)}
+
+
+def test_foreign_first():
+    out = mark_oos_reason(_state(foreign=True))
+    assert out == {"is_oos": True, "oos_reason": "foreign"}
+
+
+def test_fund():
+    out = mark_oos_reason(_state(etf=True))
+    assert out == {"is_oos": True, "oos_reason": "fund"}
+
+
+def test_digital():
+    out = mark_oos_reason(_state(digital=True))
+    assert out == {"is_oos": True, "oos_reason": "digital"}
+
+
+def test_private_only():
+    # When only private_company_likely is true (and oos_gate already excluded
+    # the IR자료/IPO/KRX-matched exceptions), result is 'private'.
+    out = mark_oos_reason(_state(private=True))
+    assert out == {"is_oos": True, "oos_reason": "private"}
+
+
+def test_priority_foreign_beats_others():
+    # If multiple flags are true, foreign takes priority (matches oos_gate routing order)
+    out = mark_oos_reason(_state(foreign=True, etf=True, digital=True, private=True))
+    assert out["oos_reason"] == "foreign"
+```
+
+- [ ] **Step 6: Implement mark_oos_reason.py**
+
+`langgraph_tagger/nodes/mark_oos_reason.py`:
+
+```python
+"""mark_oos_reason node: sets is_oos + oos_reason from LLM signals.
+
+oos_gate (routing function) ensures we only enter this node when one of the
+OOS signals is true and the §6.5 rule 4 exceptions don't apply.
+"""
+from __future__ import annotations
+
+from langgraph_tagger.state import RowState
+
+
+def mark_oos_reason(state: RowState) -> dict:
+    sig = state["llm_raw"].oos_signals
+    if sig.foreign_primary_coverage:
+        return {"is_oos": True, "oos_reason": "foreign"}
+    if sig.etf_or_fund:
+        return {"is_oos": True, "oos_reason": "fund"}
+    if sig.digital_asset:
+        return {"is_oos": True, "oos_reason": "digital"}
+    # Reached only when private_company_likely is true AND oos_gate's rule-4
+    # exceptions (KRX matched / IR자료 / IPO) all rejected.
+    return {"is_oos": True, "oos_reason": "private"}
+```
+
+- [ ] **Step 7: Run mark_oos_reason tests**
+
+Run:
+
+```powershell
+.venv\Scripts\pytest langgraph_tagger/tests/test_mark_oos_reason.py -v
+```
+
+Expected: 5 tests PASS.
+
+- [ ] **Step 8: Commit**
+
+Note: graph assembly (Task 17) wires `oos_gate` via `partial(oos_gate, krx=KRX)` and adds the `mark_oos_reason` node + edge to `status_oos`.
 
 ```bash
-git add langgraph_tagger/nodes/oos_gate.py langgraph_tagger/tests/test_oos_gate.py
+git add langgraph_tagger/nodes/oos_gate.py langgraph_tagger/nodes/mark_oos_reason.py langgraph_tagger/tests/test_oos_gate.py langgraph_tagger/tests/test_mark_oos_reason.py
 git commit -m "$(cat <<'EOF'
-feat(tagger): oos_gate 3-way conditional edge
+feat(tagger): oos_gate (routing-only) + mark_oos_reason node
 
-Routes to status_unreadable (pdf_unreadable or llm_refusal),
-status_oos (one of 4 OOS patterns), or canonicalize (in-scope).
-Sets state['oos_reason'] when entering OOS path. Implements spec
-§6.5 rule 4: private_company_likely + (KRX-matched OR IR자료) → in-scope.
+oos_gate returns one of {mark_oos_reason, status_unreadable, canonicalize}
+without mutating state (LangGraph 1.0 routing contract).
+mark_oos_reason node sets is_oos + oos_reason from LLM signals.
+Spec §6.5 rule 4 covers IR자료, KRX-matched, and KRX-unmatched IPO contexts
+all as in-scope (test_private_with_ipo_unmatched_stays_in_scope).
 EOF
 )"
 ```
@@ -2333,9 +2453,10 @@ git commit -m "$(cat <<'EOF'
 feat(tagger): canonicalize node — publisher + topic lookup
 
 publisher: returns (canonical, publisher_type) or (None, None) on miss.
-topics: returns (canonical_dedup, unmapped). publisher miss is NOT a
-review_needed trigger — decide_status records 'unknown_publisher:<value>'
-and keeps status=auto/medium (spec §6.6).
+topics: returns (canonical_dedup, unmapped). publisher miss IS a
+review_needed/low trigger in decide_status (spec 2026-05-07 §6.6 정책).
+Note for analysts (Option γ): no vocabulary mapping — raw names persist
+into analysts text[] without canonicalization.
 EOF
 )"
 ```
@@ -2413,6 +2534,39 @@ def test_unknown_sector_goes_to_unknown(krx):
     out = validate(state, krx=krx)
     assert out["sectors_major_valid"] == []
     assert "완전이상한산업" in out["sectors_unknown"]
+
+
+def test_known_product_goes_to_valid(krx):
+    state = {"llm_raw": make_llm_extraction(
+        stock_codes_raw=[], sectors_major=[], sectors_minor=[],
+        products=["DRAM", "NAND"],
+    )}
+    out = validate(state, krx=krx)
+    # Both DRAM and NAND appear in many KRX 주요제품 cells
+    assert "DRAM" in out["products_valid"]
+    assert "NAND" in out["products_valid"]
+    assert out["products_unknown"] == []
+
+
+def test_unknown_product_goes_to_unknown(krx):
+    """Spec §6.6: unknown_product → review_needed/low (no silent drop)."""
+    state = {"llm_raw": make_llm_extraction(
+        stock_codes_raw=[], sectors_major=[], sectors_minor=[],
+        products=["완전이상한제품"],
+    )}
+    out = validate(state, krx=krx)
+    assert out["products_valid"] == []
+    assert "완전이상한제품" in out["products_unknown"]
+
+
+def test_mixed_known_and_unknown_products(krx):
+    state = {"llm_raw": make_llm_extraction(
+        stock_codes_raw=[], sectors_major=[], sectors_minor=[],
+        products=["DRAM", "완전이상한제품", "NAND"],
+    )}
+    out = validate(state, krx=krx)
+    assert out["products_valid"] == ["DRAM", "NAND"]
+    assert out["products_unknown"] == ["완전이상한제품"]
 ```
 
 - [ ] **Step 2: Implement validate.py**
@@ -2420,7 +2574,12 @@ def test_unknown_sector_goes_to_unknown(krx):
 `langgraph_tagger/nodes/validate.py`:
 
 ```python
-"""validate node: KRX stock_code regex + membership; sector fuzzy match."""
+"""validate node: KRX stock_code regex + membership; sector fuzzy match;
+products substring membership.
+
+Spec §6.6 정책 보존: stock_codes/sectors/products 셋 다 KRX 도메인 외면
+review_needed/low (decide_status에서 처리). silent drop 안 함.
+"""
 from __future__ import annotations
 
 import re
@@ -2460,12 +2619,23 @@ def validate(state: RowState, *, krx: KRXIndex) -> dict:
         else:
             s_unknown.append(s)
 
+    # products: KRX substring 멤버십 검증 (spec §6.6 unknown_product → review_needed/low)
+    products_valid: list[str] = []
+    products_unknown: list[str] = []
+    for p in raw.products:
+        if any(p in e.products_text for e in krx.by_code.values()):
+            products_valid.append(p)
+        else:
+            products_unknown.append(p)
+
     return {
         "stock_codes_valid": valid_codes,
         "stock_codes_unknown": unknown_codes,
         "sectors_major_valid": smajor_valid,
         "sectors_minor_valid": sminor_valid,
         "sectors_unknown": s_unknown,
+        "products_valid": products_valid,
+        "products_unknown": products_unknown,
     }
 ```
 
@@ -2477,17 +2647,20 @@ Run:
 .venv\Scripts\pytest langgraph_tagger/tests/test_validate.py -v
 ```
 
-Expected: 5 tests PASS.
+Expected: 8 tests PASS.
 
 - [ ] **Step 4: Commit**
 
 ```bash
 git add langgraph_tagger/nodes/validate.py langgraph_tagger/tests/test_validate.py
 git commit -m "$(cat <<'EOF'
-feat(tagger): validate node — KRX code regex + membership + sector fuzzy
+feat(tagger): validate node — KRX code/sector/product membership checks
 
 stock_codes: ^[0-9A-Z]{6}$ + membership in KRX. Failures go to unknown_codes.
 sectors: fuzzy_sector_match (Auto alias etc.); membership in major/minor sets.
+products: substring membership in KRX 주요제품 cells. Unknown products go
+to products_unknown (spec §6.6 unknown_product → review_needed/low). No
+silent drop.
 EOF
 )"
 ```
@@ -2534,6 +2707,8 @@ def test_single_stock_auto_enrichment(krx, kst_dt):
         "stock_codes_valid": ["005930"],
         "sectors_major_valid": [],
         "sectors_minor_valid": [],
+        "products_valid": [],
+        "products_unknown": [],
         "sent_at": kst_dt,
     }
     out = enrich(state, krx=krx)
@@ -2561,6 +2736,8 @@ def test_industry_no_auto_enrichment(krx, kst_dt):
         "stock_codes_valid": [],
         "sectors_major_valid": ["반도체"],
         "sectors_minor_valid": [],
+        "products_valid": [],
+        "products_unknown": [],
         "sent_at": kst_dt,
     }
     out = enrich(state, krx=krx)
@@ -2570,23 +2747,30 @@ def test_industry_no_auto_enrichment(krx, kst_dt):
     assert out["published_at_final"] == date(2026, 5, 1)
 
 
-def test_products_substring_filter_drops_unknown(krx, kst_dt):
+def test_enrich_uses_products_valid_only(krx, kst_dt):
+    """enrich gets products from validate's products_valid (already filtered).
+    Unknown products are NOT silently dropped — they live in products_unknown
+    and decide_status maps them to review_needed/low (spec §6.6).
+    """
     state = {
         "llm_raw": make_llm_extraction(
             report_type="단일종목",
             stock_codes_raw=[],
             company_names=["KT&G"],
-            sectors_major=[],
-            sectors_minor=[],
-            products=["DRAM", "완전이상한제품"],   # DRAM in KRX, the other not
+            sectors_major=[], sectors_minor=[],
+            products=["DRAM", "완전이상한제품"],
             published_at="2026-05-01",
         ),
         "stock_codes_valid": [],
         "sectors_major_valid": [],
         "sectors_minor_valid": [],
+        "products_valid": ["DRAM"],          # validate already split
+        "products_unknown": ["완전이상한제품"],
         "sent_at": kst_dt,
     }
     out = enrich(state, krx=krx)
+    # Only validated products survive into products_final; enrichment may add
+    # KRX-matched tokens via single-stock rule (none here since stock_codes_valid is empty).
     assert "DRAM" in out["products_final"]
     assert "완전이상한제품" not in out["products_final"]
 
@@ -2606,6 +2790,8 @@ def test_minor_to_major_rollup(krx, kst_dt):
         "stock_codes_valid": [],
         "sectors_major_valid": [],
         "sectors_minor_valid": ["메모리반도체"],
+        "products_valid": [],
+        "products_unknown": [],
         "sent_at": kst_dt,
     }
     out = enrich(state, krx=krx)
@@ -2643,7 +2829,8 @@ def enrich(state: RowState, *, krx: KRXIndex) -> dict:
     company_names = list(raw.company_names)
     sectors_major = list(state["sectors_major_valid"])
     sectors_minor = list(state["sectors_minor_valid"])
-    products = list(raw.products)
+    # validate already enforced KRX substring membership and split unknowns aside.
+    products = list(state.get("products_valid", []))
 
     # 1. Single-stock auto-enrichment (단일종목/IR자료/IPO + KRX-matched code)
     if raw.report_type in ("단일종목", "IR자료", "IPO"):
@@ -2661,8 +2848,7 @@ def enrich(state: RowState, *, krx: KRXIndex) -> dict:
                 if tok not in products:
                     products.append(tok)
 
-    # 2. Filter products by KRX substring membership (spec §3.d)
-    products = krx.filter_products_by_membership(products)
+    # 2. validate already filtered products. No double-filter here.
 
     # 3. Depth roll-up: products → minor/major; minor → major
     for p in products:
@@ -2752,6 +2938,7 @@ def _base_state(**kwargs):
         "is_oos": False,
         "stock_codes_unknown": [],
         "sectors_unknown": [],
+        "products_unknown": [],
         "topic_unmapped": [],
         "publisher_canon": "키움증권",
         "used_sent_at_fallback": False,
@@ -2825,20 +3012,33 @@ def test_topic_unmapped_yields_auto_medium():
     assert out["tagging_confidence"] == "medium"
 
 
-def test_unknown_publisher_yields_auto_medium_with_note():
-    out = decide_status(_base_state(
-        publisher_canon=None,
-        llm_raw=make_llm_extraction(publisher_raw="UnknownBoutique"),
-    ))
-    assert out["tagging_status"] == "auto"
-    assert out["tagging_confidence"] == "medium"
-    assert "unknown_publisher:UnknownBoutique" in out["tagging_notes"]
-
-
 def test_page_fallback_yields_auto_medium():
     out = decide_status(_base_state(pages_used=[1, 2]))
     assert out["tagging_status"] == "auto"
     assert out["tagging_confidence"] == "medium"
+
+
+# ── failure: spec §6.6 elevated unknown_publisher / unknown_product ─
+
+def test_unknown_publisher_yields_review_needed():
+    """Spec 2026-05-07 §6.6: unknown_publisher → review_needed/low."""
+    out = decide_status(_base_state(
+        publisher_canon=None,
+        llm_raw=make_llm_extraction(publisher_raw="UnknownBoutique"),
+    ))
+    assert out["tagging_status"] == "review_needed"
+    assert out["tagging_confidence"] == "low"
+    assert "unknown_publisher:UnknownBoutique" in out["tagging_notes"]
+
+
+def test_unknown_product_yields_review_needed():
+    """Spec 2026-05-07 §6.6: unknown_product → review_needed/low."""
+    out = decide_status(_base_state(
+        products_unknown=["완전이상한제품"],
+    ))
+    assert out["tagging_status"] == "review_needed"
+    assert out["tagging_confidence"] == "low"
+    assert "unknown_product:완전이상한제품" in out["tagging_notes"]
 
 
 # ── combinations: validation failure dominates fallback signals ──
@@ -2849,17 +3049,33 @@ def test_unknown_stock_code_and_sent_at_fallback_still_review_needed():
     assert out["tagging_status"] == "review_needed"
 
 
-def test_unknown_publisher_alone_does_not_demote_to_review_needed():
-    """spec §6.6: unknown_publisher only → auto/medium, NOT review_needed."""
+def test_oos_row_skips_validation_failure_check():
+    """OOS rows: stock_codes_unknown / unknown_publisher are not collected as failures."""
+    # mark_oos_reason already set is_oos=True. decide_status MUST NOT collect
+    # unknown_* notes for OOS rows (their meta is empty by design).
+    out = decide_status(_base_state(
+        is_oos=True,
+        publisher_canon=None,
+        llm_raw=make_llm_extraction(publisher_raw="ExternalSource"),
+        products_unknown=["외국제품"],
+        stock_codes_unknown=["AAPL"],
+    ))
+    # Note: status_oos sets tagging_status/confidence; this test only verifies
+    # that decide_status doesn't override them with review_needed for OOS rows.
+    # In the full graph, decide_status is bypassed for OOS path, but if called
+    # directly here the result must not be review_needed/low.
+    assert out["tagging_status"] != "review_needed"
+
+
+def test_combined_unknown_publisher_and_product():
     out = decide_status(_base_state(
         publisher_canon=None,
         llm_raw=make_llm_extraction(publisher_raw="X"),
-        topic_unmapped=[],
-        used_sent_at_fallback=False,
-        pages_used=[1],
+        products_unknown=["Y"],
     ))
-    assert out["tagging_status"] == "auto"
-    assert out["tagging_confidence"] == "medium"
+    assert out["tagging_status"] == "review_needed"
+    assert "unknown_publisher:X" in out["tagging_notes"]
+    assert "unknown_product:Y" in out["tagging_notes"]
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -2870,14 +3086,22 @@ Run:
 .venv\Scripts\pytest langgraph_tagger/tests/test_decide_status.py -v
 ```
 
-Expected: 13 tests FAIL on import.
+Expected: 14 tests FAIL on import.
 
 - [ ] **Step 3: Implement decide_status.py**
 
 `langgraph_tagger/nodes/decide_status.py`:
 
 ```python
-"""decide_status node: spec §6.6 status/confidence/notes decision tree.
+"""decide_status node: spec 2026-05-07 §6.6 status/confidence/notes decision tree.
+
+Policy (spec §6.6):
+  - unknown_stock_code  → review_needed/low
+  - unknown_sector      → review_needed/low
+  - unknown_product     → review_needed/low   (spec §6.6 — no silent drop)
+  - unknown_publisher   → review_needed/low   (spec §6.6 — broker/IR-agency 분류 핵심)
+  - type_indeterminate  → review_needed/low
+  - first_page_unreadable / llm_refusal → review_needed/low
 
 This is the **rule-tree heart** of langgraph_tagger. Implementing the rules
 in code (rather than relying on the LLM to apply them) gives:
@@ -2908,23 +3132,32 @@ def decide_status(state: RowState) -> dict:
 
     notes: list[str] = []
     raw = state.get("llm_raw")
+    is_oos = bool(state.get("is_oos"))
 
     # 1. type_indeterminate: report_type='기타' + self_confidence='low' + not OOS
     if (raw is not None
             and raw.report_type == "기타"
             and raw.self_confidence == "low"
-            and not state.get("is_oos")):
+            and not is_oos):
         notes.append("type_indeterminate")
 
     # 2. Validation failures (only matter when not OOS)
-    if not state.get("is_oos"):
+    # Spec §6.6 정책: stock_codes/sectors/products/publisher 네 가지 모두
+    # KRX 도메인 / vocabulary 외면 review_needed/low.
+    if not is_oos:
         if state.get("stock_codes_unknown"):
             notes.append("unknown_stock_code:" + ",".join(state["stock_codes_unknown"]))
         if state.get("sectors_unknown"):
             notes.append("unknown_sector:" + ",".join(state["sectors_unknown"]))
+        if state.get("products_unknown"):
+            notes.append("unknown_product:" + ",".join(state["products_unknown"]))
+        if state.get("publisher_canon") is None and raw is not None and raw.publisher_raw:
+            notes.append(f"unknown_publisher:{raw.publisher_raw}")
 
     has_validation_failure = any(
-        n.startswith(("unknown_stock_code:", "unknown_sector:", "type_indeterminate"))
+        n.startswith(("unknown_stock_code:", "unknown_sector:",
+                      "unknown_product:", "unknown_publisher:",
+                      "type_indeterminate"))
         for n in notes
     )
     if has_validation_failure:
@@ -2935,15 +3168,13 @@ def decide_status(state: RowState) -> dict:
         }
 
     # 3. auto: confidence determined by fallback signals
+    # NOTE: publisher_canon=None 케이스는 위 has_validation_failure에서 처리됐으므로
+    # 여기 도달하면 publisher_canon이 채워졌거나 publisher_raw가 비어있음.
     used_fallback = (
         state.get("used_sent_at_fallback")
         or bool(state.get("topic_unmapped"))
-        or state.get("publisher_canon") is None
         or len(state.get("pages_used") or [1]) > 1
     )
-
-    if state.get("publisher_canon") is None and raw is not None and raw.publisher_raw:
-        notes.append(f"unknown_publisher:{raw.publisher_raw}")
 
     return {
         "tagging_status": "auto",
@@ -2960,7 +3191,7 @@ Run:
 .venv\Scripts\pytest langgraph_tagger/tests/test_decide_status.py -v
 ```
 
-Expected: 13 tests PASS.
+Expected: 14 tests PASS.
 
 - [ ] **Step 5: Commit**
 
@@ -2969,13 +3200,14 @@ git add langgraph_tagger/nodes/decide_status.py langgraph_tagger/tests/test_deci
 git commit -m "$(cat <<'EOF'
 feat(tagger): decide_status node — spec §6.6 rule tree as code
 
-13 unit tests cover every branch of the decision tree:
+14 unit tests cover every branch of the decision tree:
 - pdf_unreadable / llm_refusal → review_needed/low
-- unknown_stock_code / unknown_sector / type_indeterminate → review_needed/low
+- unknown_stock_code / unknown_sector / unknown_product / unknown_publisher /
+  type_indeterminate → review_needed/low (spec 2026-05-07 §6.6 보존)
 - all clean → auto/high
 - used_sent_at_fallback / topic_unmapped / pages_used > 1 → auto/medium
-- unknown_publisher alone → auto/medium with note (NOT review_needed)
 - validation failure dominates fallback signals
+- OOS rows skip validation failure check
 EOF
 )"
 ```
@@ -3015,7 +3247,7 @@ STALE_LOCK_RECLAIM_SQL = """
 UPDATE reports
    SET tagging_status='pending', tagging_locked_at=NULL, tagging_worker_id=NULL
  WHERE tagging_status='processing'
-   AND tagging_locked_at < now() - interval '30 minutes'
+   AND tagging_locked_at < now() - ($1::int * interval '1 minute')
 """
 
 ATOMIC_CLAIM_SQL = """
@@ -3355,8 +3587,9 @@ def test_atomic_claim_uses_skip_locked():
     assert "tagging_status='processing'" in ATOMIC_CLAIM_SQL
 
 
-def test_stale_reclaim_uses_30_min_threshold():
-    assert "30 minutes" in STALE_LOCK_RECLAIM_SQL
+def test_stale_reclaim_uses_param_threshold():
+    # Threshold is parameterized via $1::int (LOCK_TTL_MINUTES from env), not hardcoded.
+    assert "$1::int * interval '1 minute'" in STALE_LOCK_RECLAIM_SQL
 
 
 def test_dry_run_select_does_not_mutate():
@@ -3465,12 +3698,12 @@ async def test_oos_foreign_short_circuits_to_status_oos(krx, mock_openai_client,
     doc.close()
     monkeypatch.setenv("STORAGE_BASE_DIR", str(tmp_path))
 
-    # Mock OpenAI to return foreign signal
+    # Mock OpenAI to return foreign primary coverage signal
     from langgraph_tagger.llm_schemas import OOSSignals
     mock_openai_client.set_response(make_llm_extraction(
         report_type="기타",
         oos_signals=OOSSignals(
-            foreign_ticker_seen=True, etf_or_fund=False,
+            foreign_primary_coverage=True, etf_or_fund=False,
             digital_asset=False, private_company_likely=False,
         ),
     ))
@@ -3505,7 +3738,7 @@ async def test_oos_foreign_short_circuits_to_status_oos(krx, mock_openai_client,
 `langgraph_tagger/graph.py`:
 
 ```python
-"""Assemble the row-graph from the 9 node modules."""
+"""Assemble the row-graph from the 10 node modules."""
 from __future__ import annotations
 
 from functools import partial
@@ -3517,6 +3750,7 @@ from langgraph_tagger.nodes.decide_status import decide_status
 from langgraph_tagger.nodes.enrich import enrich
 from langgraph_tagger.nodes.extract_pdf import extract_pdf
 from langgraph_tagger.nodes.llm_extract import llm_extract
+from langgraph_tagger.nodes.mark_oos_reason import mark_oos_reason
 from langgraph_tagger.nodes.oos_gate import oos_gate
 from langgraph_tagger.nodes.status_oos import status_oos
 from langgraph_tagger.nodes.status_unreadable import status_unreadable
@@ -3531,6 +3765,7 @@ def build_graph(client, sb, *, krx: KRXIndex, dry_run: bool, taxonomy_version: s
 
     g.add_node("extract_pdf", extract_pdf)
     g.add_node("llm_extract", partial(llm_extract, client=client))
+    g.add_node("mark_oos_reason", mark_oos_reason)
     g.add_node("status_oos", status_oos)
     g.add_node("status_unreadable", status_unreadable)
     g.add_node("canonicalize", canonicalize)
@@ -3541,15 +3776,18 @@ def build_graph(client, sb, *, krx: KRXIndex, dry_run: bool, taxonomy_version: s
 
     g.add_edge(START, "extract_pdf")
     g.add_edge("extract_pdf", "llm_extract")
+    # oos_gate is routing-only — uses partial to inject KRX. mark_oos_reason
+    # is a separate state-mutating node that sets is_oos / oos_reason.
     g.add_conditional_edges(
         "llm_extract",
         partial(oos_gate, krx=krx),
         {
-            "status_oos": "status_oos",
+            "mark_oos_reason":   "mark_oos_reason",
             "status_unreadable": "status_unreadable",
-            "canonicalize": "canonicalize",
+            "canonicalize":      "canonicalize",
         },
     )
+    g.add_edge("mark_oos_reason", "status_oos")
     g.add_edge("status_oos", "write")
     g.add_edge("status_unreadable", "write")
     g.add_edge("canonicalize", "validate")
@@ -3719,6 +3957,59 @@ async def test_empty_claim_returns_zero_processed(krx, mock_openai_client, mock_
     assert report["processed"] == 0
     # No graph invocations
     mock_openai_client.chat.completions.parse.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_per_row_deadline_reverts_to_pending(krx, mock_openai_client, mock_supabase, make_pdf, monkeypatch):
+    """Long-running rows should hit asyncio.wait_for and REVERT."""
+    import asyncio
+    monkeypatch.setattr("langgraph_tagger.orchestrator.PER_ROW_DEADLINE_S", 0.01)
+    mock_supabase.queue_fetch([_row(7)])
+
+    async def _slow(*a, **kw):
+        await asyncio.sleep(1.0)
+        return mock_openai_client.chat.completions.parse.return_value
+    mock_openai_client.chat.completions.parse = _slow
+
+    report = await run_batch(
+        sb=mock_supabase, client=mock_openai_client, krx=krx,
+        taxonomy_version="KRX@2026-05-08",
+        batch_size=10, dry_run=False, row_ids=[],
+        model="gpt-5.4-mini", max_concurrent_llm=4, worker_id="w1",
+    )
+    assert any("tagging_status='pending'" in sql and args == (7,)
+               for sql, args in mock_supabase.executed)
+    # report should record the deadline error
+    assert report["transient_errors"] + report.get("deadline_errors", 0) >= 1
+
+
+@pytest.mark.asyncio
+async def test_unhandled_exception_does_not_burst_gather(krx, mock_openai_client, mock_supabase, make_pdf):
+    """A node raising an unexpected exception must NOT crash gather()."""
+    mock_supabase.queue_fetch([_row(11), _row(12)])
+
+    # First call raises, second succeeds
+    call_state = {"n": 0}
+    async def _flaky(*a, **kw):
+        call_state["n"] += 1
+        if call_state["n"] == 1:
+            raise RuntimeError("simulated unknown failure")
+        return mock_openai_client.chat.completions.parse.return_value
+    mock_openai_client.chat.completions.parse = _flaky
+    # Set a default valid response for the non-raising path
+    mock_openai_client.set_response(make_llm_extraction())
+
+    report = await run_batch(
+        sb=mock_supabase, client=mock_openai_client, krx=krx,
+        taxonomy_version="KRX@2026-05-08",
+        batch_size=10, dry_run=False, row_ids=[],
+        model="gpt-5.4-mini", max_concurrent_llm=4, worker_id="w1",
+    )
+    # Both rows accounted for; first reverted as 'unhandled', second processed.
+    assert report["processed"] == 2
+    revert_calls = [args for sql, args in mock_supabase.executed
+                    if "tagging_status='pending'" in sql and "id=$1" in sql]
+    assert (11,) in revert_calls
 ```
 
 - [ ] **Step 2: Implement orchestrator.py**
@@ -3726,10 +4017,16 @@ async def test_empty_claim_returns_zero_processed(krx, mock_openai_client, mock_
 `langgraph_tagger/orchestrator.py`:
 
 ```python
-"""Batch orchestration: claim → fan-out via Semaphore → aggregate."""
+"""Batch orchestration: claim → fan-out via Semaphore → aggregate.
+
+Per-row deadline + broad except boundary so a single row failure cannot crash
+asyncio.gather() and leave others stuck in 'processing'. LOCK_TTL_MINUTES is
+bound to STALE_LOCK_RECLAIM_SQL via $1.
+"""
 from __future__ import annotations
 
 import asyncio
+import os
 from collections import Counter
 from typing import Any
 
@@ -3740,6 +4037,10 @@ from langgraph_tagger.supabase_io import (
     ROW_IDS_FETCH_SQL, STALE_LOCK_RECLAIM_SQL,
 )
 from langgraph_tagger.vocabulary.krx import KRXIndex
+
+# Read at import time; tests can monkeypatch the module attributes for deadlines.
+LOCK_TTL_MINUTES = int(os.environ.get("LOCK_TTL_MINUTES", "30"))
+PER_ROW_DEADLINE_S = float(os.environ.get("PER_ROW_DEADLINE_S", "90"))
 
 
 async def run_batch(
@@ -3761,9 +4062,9 @@ async def run_batch(
     - dry_run mode: SELECT only, no status mutation
     - row_ids mode: skip claim, fetch by id, status not mutated even if not 'pending'
     """
-    # 1. stale lock reclaim (only in normal run mode)
+    # 1. stale lock reclaim (only in normal run mode). LOCK_TTL_MINUTES bound.
     if not row_ids and not dry_run:
-        await sb.execute(STALE_LOCK_RECLAIM_SQL)
+        await sb.execute(STALE_LOCK_RECLAIM_SQL, [LOCK_TTL_MINUTES])
 
     # 2. fetch rows
     if row_ids:
@@ -3776,22 +4077,40 @@ async def run_batch(
     if not rows:
         return _empty_report(model)
 
-    # 3. fan-out via Semaphore
+    # 3. fan-out via Semaphore + per-row deadline + broad except boundary
     app = build_graph(client, sb, krx=krx, dry_run=dry_run, taxonomy_version=taxonomy_version)
     sem = asyncio.Semaphore(max_concurrent_llm)
-    results: list[dict] = []
+
+    async def _revert(row_id: int) -> None:
+        if not dry_run and not row_ids:
+            try:
+                await sb.execute(REVERT_TO_PENDING_SQL, [row_id])
+            except Exception:
+                # If REVERT itself fails, row stays 'processing' and stale-lock
+                # reclaim recovers it after LOCK_TTL_MINUTES.
+                pass
 
     async def _process(row):
         async with sem:
             init_state = {**row, "worker_id": worker_id, "model": model}
             try:
-                final = await app.ainvoke(init_state)
+                final = await asyncio.wait_for(
+                    app.ainvoke(init_state),
+                    timeout=PER_ROW_DEADLINE_S,
+                )
                 return {"id": row["id"], **final}
             except OpenAITransientError as e:
-                # Revert row to pending so the next call retries it
-                if not dry_run and not row_ids:
-                    await sb.execute(REVERT_TO_PENDING_SQL, [row["id"]])
+                await _revert(row["id"])
                 return {"id": row["id"], "error": "transient", "detail": str(e)}
+            except asyncio.TimeoutError:
+                await _revert(row["id"])
+                return {"id": row["id"], "error": "deadline_exceeded"}
+            except Exception as e:
+                # Broad except defends gather() from any unexpected node/IO error.
+                # Row reverts to pending so a future run retries.
+                await _revert(row["id"])
+                return {"id": row["id"], "error": "unhandled",
+                        "detail": f"{type(e).__name__}:{e}"}
 
     results = await asyncio.gather(*[_process(r) for r in rows])
 
@@ -3807,6 +4126,8 @@ def _empty_report(model: str) -> dict:
         "oos": {"foreign": 0, "fund": 0, "digital": 0, "private": 0},
         "review_reasons": {},
         "transient_errors": 0,
+        "deadline_errors": 0,
+        "unhandled_errors": 0,
     }
 
 
@@ -3814,6 +4135,8 @@ def _aggregate(results: list[dict], *, model: str, batch_size: int, dry_run: boo
     auto = sum(1 for r in results if r.get("tagging_status") == "auto")
     review = sum(1 for r in results if r.get("tagging_status") == "review_needed")
     transient = sum(1 for r in results if r.get("error") == "transient")
+    deadline = sum(1 for r in results if r.get("error") == "deadline_exceeded")
+    unhandled = sum(1 for r in results if r.get("error") == "unhandled")
 
     conf_counter = Counter(r.get("tagging_confidence") for r in results if "tagging_confidence" in r)
     oos_counter = Counter(r.get("oos_reason") for r in results if r.get("is_oos"))
@@ -3826,7 +4149,8 @@ def _aggregate(results: list[dict], *, model: str, batch_size: int, dry_run: boo
                 continue
             tag = token.split(":", 1)[0]
             if tag in ("first_page_unreadable", "llm_refusal", "type_indeterminate",
-                       "unknown_stock_code", "unknown_sector", "unknown_publisher"):
+                       "unknown_stock_code", "unknown_sector",
+                       "unknown_product", "unknown_publisher"):
                 review_reasons[tag] += 1
 
     return {
@@ -3847,6 +4171,8 @@ def _aggregate(results: list[dict], *, model: str, batch_size: int, dry_run: boo
         },
         "review_reasons": dict(review_reasons),
         "transient_errors": transient,
+        "deadline_errors": deadline,
+        "unhandled_errors": unhandled,
         "dry_run": dry_run,
         "batch_size": batch_size,
     }
@@ -3860,19 +4186,23 @@ Run:
 .venv\Scripts\pytest langgraph_tagger/tests/test_orchestrator.py -v
 ```
 
-Expected: 5 tests PASS.
+Expected: 7 tests PASS (5 base + per-row deadline + broad exception).
 
 - [ ] **Step 4: Commit**
 
 ```bash
 git add langgraph_tagger/orchestrator.py langgraph_tagger/tests/test_orchestrator.py
 git commit -m "$(cat <<'EOF'
-feat(tagger): orchestrator — batch claim, fan-out, aggregation
+feat(tagger): orchestrator — claim, fan-out, deadlines, broad except
 
-run_batch: stale_reclaim → atomic_claim (or row_ids fetch / dry-run select) →
-asyncio.gather + Semaphore → aggregate report. Transient OpenAI errors revert
-the row to pending (skip in row_ids/dry_run modes). Aggregator counts
-auto/review_needed, confidence dist, OOS dist, review reasons.
+run_batch: stale_reclaim (LOCK_TTL_MINUTES bind) → atomic_claim (or row_ids
+fetch / dry-run select) → asyncio.gather + Semaphore + asyncio.wait_for
+(PER_ROW_DEADLINE_S) → aggregate report. Per-row try/except catches
+OpenAITransientError (REVERT), TimeoutError (REVERT, deadline_exceeded),
+and broad Exception (REVERT, unhandled) so a single row failure cannot
+crash gather. Aggregator counts auto/review_needed, confidence/OOS dist,
+review reasons (incl. unknown_product/unknown_publisher), and
+transient/deadline/unhandled errors.
 EOF
 )"
 ```
@@ -3910,6 +4240,11 @@ class TaggerConfig:
     batch_size_default: int
     krx_csv_path: Path
     supabase_db_url: str
+    # Concurrency / lock safety knobs (spec §9.5)
+    lock_ttl_minutes: int
+    per_row_deadline_s: float
+    heartbeat_enabled: bool
+    heartbeat_interval_s: int
 
 
 def load_config() -> TaggerConfig:
@@ -3927,6 +4262,10 @@ def load_config() -> TaggerConfig:
         batch_size_default=int(os.environ.get("TAGGER_BATCH_SIZE_DEFAULT", "10")),
         krx_csv_path=Path(os.environ.get("KRX_CSV_PATH", "docs/stock_data/KRX_stocks_data.csv")),
         supabase_db_url=_req("SUPABASE_DB_URL"),
+        lock_ttl_minutes=int(os.environ.get("LOCK_TTL_MINUTES", "30")),
+        per_row_deadline_s=float(os.environ.get("PER_ROW_DEADLINE_S", "90")),
+        heartbeat_enabled=os.environ.get("HEARTBEAT_ENABLED", "false").lower() == "true",
+        heartbeat_interval_s=int(os.environ.get("HEARTBEAT_INTERVAL_S", "30")),
     )
 ```
 
@@ -4093,7 +4432,302 @@ EOF
 
 ---
 
-### Task 20: Live dry-run smoke test
+### Task 20: Parity regression test against friendly-mclaren skill outputs
+
+**Files:**
+- Create: `langgraph_tagger/tests/test_parity.py`
+- Create: `langgraph_tagger/tests/parity/fixtures.json`
+- Create: `langgraph_tagger/tests/parity/README.md`
+
+The `parity` regression locks the project's central claim — "execution
+environment changed, results preserved" — into an automated check. Each
+fixture records (input PDF + LLM mock response) → (expected DB UPDATE
+payload) and the test runs the entire row graph headlessly.
+
+- [ ] **Step 1: Inventory friendly-mclaren evals workspace**
+
+```powershell
+git ls-tree -r --name-only claude/friendly-mclaren-815e01 | Select-String "report-metadata-tagger-workspace.*result\.json"
+```
+
+If result.json files exist, use them as parity ground truth (Step 2). If
+nothing exists or coverage is sparse (<6 cases), fall through to Step 3 and
+hand-write fixtures based on the spec.
+
+- [ ] **Step 2: Extract and convert ground truth (when available)**
+
+For each `result.json` found, extract: file_path/file_name (input), the
+LLM-extracted candidate fields (mock-able), and the final DB row state
+(expected). Save to `langgraph_tagger/tests/parity/fixtures.json` as a
+list of objects:
+
+```json
+[
+  {
+    "case": "single_stock_kt&g",
+    "input": {
+      "file_name": "KT&G_2025_4Q_preview.pdf",
+      "caption": null,
+      "sent_at": "2026-04-30T09:00:00+00:00",
+      "pdf_text": "키움증권 리서치센터 ... 분석가: 홍길동 ..."
+    },
+    "llm_mock": {
+      "report_type": "단일종목",
+      "title": "KT&G 2025 4Q Preview",
+      "published_at": "2026-04-30",
+      "stock_codes_raw": ["033780"],
+      "company_names": ["KT&G"],
+      "sectors_major": ["내수"],
+      "sectors_minor": [],
+      "products": ["담배", "인삼"],
+      "publisher_raw": "키움증권",
+      "analysts": ["홍길동"],
+      "topics": ["배당"],
+      "oos_signals": {
+        "foreign_primary_coverage": false, "etf_or_fund": false,
+        "digital_asset": false, "private_company_likely": false
+      },
+      "self_confidence": "high",
+      "notes": null
+    },
+    "expected": {
+      "tagging_status": "auto",
+      "tagging_confidence": "high",
+      "out_of_scope_reason": null,
+      "report_type": "단일종목",
+      "publisher": "키움증권",
+      "publisher_type": "broker",
+      "stock_codes": ["033780"],
+      "company_names_contains": ["KT&G"],
+      "sectors_major_contains": ["내수"],
+      "topics_contains": ["배당"],
+      "tagging_notes": null
+    }
+  }
+]
+```
+
+(`*_contains` keys assert membership — enrich auto-merges KRX rows so the
+final list may have extra entries beyond the LLM-extracted ones.)
+
+Cases to cover (≥10):
+1. `single_stock` — KT&G 단일종목, KRX 매칭, vocabulary 매칭 → auto/high
+2. `industry` — 반도체 산업 → auto/high
+3. `daily_market` — 시황·데일리 → auto/high
+4. `ipo_listed` — KRX 매칭 종목의 IPO update → 단일종목 (precedence rule 3)
+5. `ipo_unlisted` — KRX 미매칭 + IPO 컨텍스트 → in-scope IPO (rule 4)
+6. `ir_company_self` — 자체 IR자료 → in-scope IR자료 (rule 4)
+7. `domestic_with_foreign_peer` — 국내 단일종목 + AAPL/NVDA 언급 → in-scope (foreign_primary_coverage=false)
+8. `foreign_primary` — 해외 단일종목 → OOS foreign
+9. `etf_lineup` — ETF 라인업 → OOS fund
+10. `unknown_publisher_in_scope` — vocab 외 broker → review_needed/low (`unknown_publisher:<value>`)
+11. `unknown_product_in_scope` — KRX 외 product → review_needed/low (`unknown_product:<value>`)
+12. `digital_btc` — BTC 분석 → OOS digital
+
+- [ ] **Step 3: Write fixtures.json**
+
+If Step 2 yielded data, paste it. Otherwise hand-author the same shape from
+spec rules + KRX entries the implementer chooses (must include all 12
+cases above).
+
+- [ ] **Step 4: Write the parity test**
+
+`langgraph_tagger/tests/test_parity.py`:
+
+```python
+"""Parity regression: run the row graph headlessly per fixture and assert
+the DB UPDATE payload matches the expected snapshot from friendly-mclaren
+skill outputs (or hand-curated equivalents).
+
+This is the primary check that environment-change-only is honoured.
+"""
+from __future__ import annotations
+
+import json
+from datetime import datetime
+from pathlib import Path
+
+import pytest
+
+from langgraph_tagger.graph import build_graph
+from langgraph_tagger.llm_schemas import LLMExtraction, OOSSignals
+from langgraph_tagger.supabase_io import UPDATE_SQL
+
+
+FIXTURES = Path(__file__).parent / "parity" / "fixtures.json"
+
+
+def _load_fixtures() -> list[dict]:
+    return json.loads(FIXTURES.read_text(encoding="utf-8"))
+
+
+def _make_llm_mock(payload: dict) -> LLMExtraction:
+    payload = dict(payload)
+    payload["oos_signals"] = OOSSignals(**payload["oos_signals"])
+    return LLMExtraction(**payload)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fix", _load_fixtures(), ids=lambda f: f["case"])
+async def test_parity(fix, krx, mock_openai_client, mock_supabase, monkeypatch, tmp_path):
+    # Stub PDF on disk — extract_pdf reads STORAGE_BASE_DIR/<file_path>
+    pdf = tmp_path / fix["input"]["file_name"]
+    import fitz
+    doc = fitz.open()
+    doc.new_page().insert_text((72, 72), fix["input"]["pdf_text"], fontsize=11)
+    doc.save(pdf)
+    doc.close()
+    monkeypatch.setenv("STORAGE_BASE_DIR", str(tmp_path))
+
+    mock_openai_client.set_response(_make_llm_mock(fix["llm_mock"]))
+
+    app = build_graph(mock_openai_client, mock_supabase, krx=krx,
+                      dry_run=False, taxonomy_version="KRX@parity-test")
+    init = {
+        "id": 1,
+        "file_path": fix["input"]["file_name"],
+        "file_name": fix["input"]["file_name"],
+        "sent_at": datetime.fromisoformat(fix["input"]["sent_at"]),
+        "caption": fix["input"]["caption"],
+        "chat_username": "x",
+        "worker_id": "parity",
+        "model": "gpt-5.4-mini",
+    }
+    await app.ainvoke(init)
+
+    # Inspect the recorded UPDATE payload
+    assert len(mock_supabase.executed) == 1
+    sql, args = mock_supabase.executed[0]
+    assert sql == UPDATE_SQL
+
+    # Map UPDATE bind args to dict for readable assertions
+    columns = ["id", "published_at", "report_type", "publisher", "publisher_type",
+               "analysts", "title", "stock_codes", "company_names",
+               "sectors_major", "sectors_minor", "products", "topics",
+               "out_of_scope_reason", "tagging_status", "tagging_confidence",
+               "tagging_notes", "taxonomy_version"]
+    actual = dict(zip(columns, args))
+
+    expected = fix["expected"]
+    for k, v in expected.items():
+        if k.endswith("_contains"):
+            base = k[: -len("_contains")]
+            for item in v:
+                assert item in actual[base], f"{base} missing {item} (got {actual[base]})"
+        else:
+            assert actual[k] == v, f"{k}: expected {v!r}, got {actual[k]!r}"
+```
+
+- [ ] **Step 5: Run**
+
+```powershell
+.venv\Scripts\pytest langgraph_tagger/tests/test_parity.py -v
+```
+
+Expected: 12 (or N) tests PASS — one per case. Any failure means the
+LangGraph implementation diverged from the friendly-mclaren skill output
+for that fixture; investigate before claiming parity.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add langgraph_tagger/tests/test_parity.py langgraph_tagger/tests/parity/
+git commit -m "$(cat <<'EOF'
+test(tagger): parity regression against friendly-mclaren skill outputs
+
+Fixtures cover 12 representative cases (14 type + 4 OOS + boundaries).
+Each fixture: PDF input + LLM mock → expected UPDATE payload. Headless
+graph run via mock_openai + mock_supabase. Confirms result-equivalence
+with the original Claude/Codex skill — the project's core claim.
+EOF
+)"
+```
+
+---
+
+### Task 21: Golden boundary-case fixtures
+
+**Files:**
+- Create or import: `langgraph_tagger/tests/golden/<case>.pdf` (≥6 PDFs)
+- Modify: `langgraph_tagger/tests/golden/README.md`
+
+These are real (or synthesized) PDFs that exercise the spec §6.5 rule 4
+boundaries and the policy-changed unknown_*  paths. Used by integration
+tests that exercise extract_pdf for real (not synthesized text only).
+
+- [ ] **Step 1: Pull existing PDFs from friendly-mclaren evals (if available)**
+
+```powershell
+git ls-tree -r --name-only claude/friendly-mclaren-815e01 | Select-String "\.pdf$"
+```
+
+For each match that fits a golden case below, copy with:
+
+```powershell
+git checkout claude/friendly-mclaren-815e01 -- <relative-path-to-pdf>
+git mv <relative-path-to-pdf> langgraph_tagger/tests/golden/<rename>.pdf
+```
+
+- [ ] **Step 2: For missing cases, synthesize minimal PDFs**
+
+Use PyMuPDF to create one-page PDFs with the exact header text needed.
+Required cases not yet covered by Task 8 fixtures:
+
+| File | Header text snippet |
+|---|---|
+| `ipo_unlisted.pdf` | `"신영증권 IPO 분석\n공모예정 ABC테크\n공모가 밴드 5,000~6,000원"` (KRX 미매칭 IPO 후보) |
+| `domestic_with_foreign_peer.pdf` | `"키움증권 삼성전자 1Q26 Preview\n분석가 홍길동\nNVDA H100 수요 ↑"` (국내 단일종목, NVDA peer 언급) |
+| `ir_company_self.pdf` | `"휴온스 Investor Relations\nIR Material 2026.04\n비상장 자회사 현황"` (자체 IR, 비상장 자회사 언급) |
+| `unknown_publisher_in_scope.pdf` | `"NewBoutique Research\n분석가 김신규\n삼성전자 [005930] 매수\n목표주가 100,000원"` |
+| `unknown_product_in_scope.pdf` | `"키움증권 분석\nABC텍 [123456] 매수\n주요제품: 완전이상한제품"` |
+| `private_unlisted.pdf` | `"비상장사 ABC 분석\n[000000]\n장외 시장 동향"` |
+
+```python
+# helper used in conftest or tests/golden/_synthesize.py:
+import fitz
+def synth(path, text):
+    d = fitz.open(); d.new_page().insert_text((72, 72), text, fontsize=11)
+    d.save(path); d.close()
+```
+
+- [ ] **Step 3: Update golden README**
+
+`langgraph_tagger/tests/golden/README.md`:
+
+```markdown
+# Golden PDFs for langgraph_tagger
+
+Each PDF maps to a spec rule. Fail at parity test = drift from spec §6.5/§6.6.
+
+| File | Maps to | Expected outcome |
+|---|---|---|
+| ipo_unlisted.pdf | §6.5 Rule 4 (KRX-unmatched + IPO) | in-scope IPO, stock_codes=[], company_names=["ABC테크"] |
+| domestic_with_foreign_peer.pdf | foreign_primary_coverage=false (peer mention) | in-scope 단일종목, stock_codes=["005930"] |
+| ir_company_self.pdf | §6.5 Rule 4 (publisher_type=company) | in-scope IR자료, publisher="휴온스" |
+| unknown_publisher_in_scope.pdf | §6.6 unknown_publisher | review_needed/low, notes="unknown_publisher:NewBoutique Research" |
+| unknown_product_in_scope.pdf | §6.6 unknown_product | review_needed/low, notes contains "unknown_product:" |
+| private_unlisted.pdf | OOS private | auto/medium, oos_reason="private" |
+| (… plus existing single_stock_*, industry_*, foreign_primary, etf_lineup, digital_btc, etc.) | | |
+```
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add langgraph_tagger/tests/golden/
+git commit -m "$(cat <<'EOF'
+test(tagger): golden PDFs for §6.5 rule 4 boundaries + §6.6 unknown_*
+
+Adds ipo_unlisted, domestic_with_foreign_peer, ir_company_self,
+unknown_publisher_in_scope, unknown_product_in_scope, private_unlisted.
+PDFs synthesized via PyMuPDF (or imported from friendly-mclaren evals).
+Maps to spec rule + expected outcome documented in golden/README.md.
+EOF
+)"
+```
+
+---
+
+### Task 22: Live dry-run smoke test
 
 **Files:** none (verification step)
 
@@ -4183,40 +4817,53 @@ After this plan was written, here are the spec-coverage and consistency checks:
 |---|---|
 | §3 비범위 (master untouched) | Task 2 (sidecar package) |
 | §4 결정 표 8개 | Tasks 6, 7, 8, 9, 17 |
-| §5 산출물 4개 | Tasks 1 (mig+CSV), 2-19 (package), 20 (verification) |
+| §5 산출물 4개 | Tasks 1 (mig+CSV), 2-19 (package), 20-21 (parity+golden), 22 (verification) |
 | §6.1 큰 그림 | Task 17 (graph assembly) |
 | §6.2 escalation | Task 19 (cli escalate) |
 | §6.3 디렉토리 구조 | Task 2 |
 | §6.4 CLI | Task 19 |
 | §7.1 RowState | Task 6 |
-| §7.2 LLMExtraction | Task 6 |
+| §7.2 LLMExtraction (foreign_primary_coverage 포함) | Task 6 |
 | §7.3 Vocabulary YAML | Task 3 |
 | §7.4 KRXIndex | Task 5 |
 | §8.1 extract_pdf | Task 8 |
 | §8.2 llm_extract | Task 9 |
-| §8.3 oos_gate | Task 10 |
+| §8.3 oos_gate (routing-only) | Task 10 (oos_gate.py) |
+| §8.3.1 mark_oos_reason | Task 10 (mark_oos_reason.py) |
 | §8.4 status_oos | Task 11 |
 | §8.4.1 status_unreadable | Task 11 |
 | §8.5 canonicalize | Task 12 |
-| §8.6 validate | Task 13 |
-| §8.7 enrich | Task 14 |
-| §8.8 decide_status | Task 15 |
+| §8.6 validate (products_valid/products_unknown 포함) | Task 13 |
+| §8.7 enrich (filter 호출 제거) | Task 14 |
+| §8.8 decide_status (unknown_publisher/product → review_needed/low) | Task 15 |
 | §8.9 write | Task 16 |
-| §8.10 graph 조립 | Task 17 |
-| §9.1 Supabase SQL | Task 16 (supabase_io.py) |
-| §9.2 Orchestrator | Task 18 |
-| §9.3 에러 처리 | Tasks 9 (transient), 11 (refusal), 18 (revert) |
-| §9.4 환경 변수 | Tasks 2 (.env.example), 19 (config.py) |
-| §9.5 동시성 한계 | Task 18 (Semaphore) |
-| §9.6 테스트 전략 | All TDD tasks |
-| §9.7 운영 보고 | Task 18 (_aggregate) |
+| §8.10 graph 조립 (mark_oos_reason 노드 추가) | Task 17 |
+| §9.1 Supabase SQL (LOCK_TTL_MINUTES bind) | Task 16 (supabase_io.py) |
+| §9.2 Orchestrator (broad except + per-row deadline) | Task 18 |
+| §9.3 에러 처리 (transient/refusal/timeout/unhandled) | Tasks 9 (transient), 11 (refusal), 18 (deadline + broad except) |
+| §9.4 환경 변수 (LOCK_TTL/PER_ROW_DEADLINE/HEARTBEAT) | Tasks 2 (.env.example), 19 (config.py) |
+| §9.5 동시성 + lock 운영 | Task 18 (Semaphore + wait_for + LOCK_TTL bind) |
+| §9.6 테스트 전략 (parity 포함) | All TDD tasks + Task 20 (parity) + Task 21 (golden) |
+| §9.7 운영 보고 (unknown_product/unknown_publisher counts) | Task 18 (_aggregate) |
+| §9.7.1 unknown_publisher/product 분포 쿼리 흐름 | Operational SQL — included in spec; no plan task needed |
 | §10 의존성 | Task 2 |
 | §11 매핑 | Implicit — every spec rule has a task |
 | §12 변경 가능성 | (out of scope for plan) |
-| §13 운영 흐름 10단계 | Task 1 (steps 1-3), Tasks 2-19 (steps 4-7), Task 20 (steps 8-10) |
+| §13 운영 흐름 11단계 | Task 1 (steps 1-3), Tasks 2-19 (steps 4-7), Task 22 (steps 8-10), spec §9.7.1 (step 11) |
 
 All sections covered. No gaps.
 
-**Type consistency check:** `KRXIndex`, `RowState`, `LLMExtraction`, `OOSSignals`, `SupabaseSQL`, `OpenAITransientError`, function names (`lookup_publisher`, `map_topics`, `validate_code`, `lookup`, `split_products`, `fuzzy_sector_match`, `filter_products_by_membership`, `rows_with_product`, `rows_with_sector_minor`, `extract_pdf`, `llm_extract`, `oos_gate`, `status_oos`, `status_unreadable`, `canonicalize`, `validate`, `enrich`, `decide_status`, `write`, `build_graph`, `run_batch`, `load_config`) — all consistent across tasks.
+**Type consistency check:** `KRXIndex`, `RowState`, `LLMExtraction`, `OOSSignals` (with `foreign_primary_coverage`), `SupabaseSQL`, `OpenAITransientError`, function names (`lookup_publisher`, `map_topics`, `validate_code`, `lookup`, `split_products`, `fuzzy_sector_match`, `filter_products_by_membership`, `rows_with_product`, `rows_with_sector_minor`, `extract_pdf`, `llm_extract`, `oos_gate`, `mark_oos_reason`, `status_oos`, `status_unreadable`, `canonicalize`, `validate`, `enrich`, `decide_status`, `write`, `build_graph`, `run_batch`, `load_config`) — all consistent across tasks.
+
+**Policy-change verification (revision 2):**
+- `unknown_publisher` → review_needed/low: Task 12 commit message + Task 15 test `test_unknown_publisher_yields_review_needed` + decide_status code branch + spec §6.6.
+- `unknown_product` → review_needed/low: Task 13 test `test_unknown_product_goes_to_unknown` + Task 15 test `test_unknown_product_yields_review_needed` + decide_status code branch + spec §6.6.
+- `oos_gate` routing-only: Task 10 test `test_routing_function_does_not_mutate_state_in_any_branch` + spec §8.3 docstring "routing-only" + LangGraph 1.0 contract.
+- `foreign_primary_coverage` rename: Task 6 schema + Task 7 prompt + Task 9 conftest factory + Task 10 oos_gate + graph test + parity fixture defaults.
+- `private_company_likely` + IPO unmatched stays in-scope: Task 10 test `test_private_with_ipo_unmatched_stays_in_scope` + spec §6.5 rule 4 + parity fixture `ipo_unlisted`.
+- `split_products` trailing ` 등` removal: Task 5 code + Task 5 test `test_simple_split` ("DRAM, NAND 등" → ["DRAM", "NAND"]).
+- per-row deadline + broad except: Task 18 orchestrator code + tests `test_per_row_deadline_reverts_to_pending` and `test_unhandled_exception_does_not_burst_gather`.
+- LOCK_TTL_MINUTES env-bound: Task 16 SQL + Task 18 orchestrator + Task 19 config.
+- analysts no vocabulary mapping (Option γ): explicit in Task 12 commit message, schema unchanged.
 
 **Placeholder scan:** No "TBD", "TODO", or unfilled steps. Each step has either a code block, an exact command with expected output, or a verification SQL.
