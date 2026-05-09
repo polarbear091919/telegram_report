@@ -28,9 +28,27 @@ def _parse_row_ids(s: str) -> list[int]:
     return [int(x) for x in s.split(",") if x.strip()]
 
 
+def _make_openai_client(api_key: str) -> AsyncOpenAI:
+    """AsyncOpenAI client, optionally wrapped for LangSmith.
+
+    When LANGSMITH_TRACING=true and a key is set, wrap_openai instruments
+    chat.completions.parse so each call shows up as a child LLM run under
+    the surrounding LangGraph span (tokens, latency, full prompt/response).
+    Otherwise returns the raw client untouched (no-op).
+    """
+    client = AsyncOpenAI(api_key=api_key, max_retries=2, timeout=60.0)
+    if os.environ.get("LANGSMITH_TRACING", "").lower() == "true" and os.environ.get("LANGSMITH_API_KEY"):
+        try:
+            from langsmith.wrappers import wrap_openai
+            return wrap_openai(client)
+        except ImportError:
+            pass
+    return client
+
+
 async def _cmd_run(args, cfg):
     sb = await SupabaseSQL.from_env()
-    client = AsyncOpenAI(api_key=cfg.openai_api_key, max_retries=2, timeout=60.0)
+    client = _make_openai_client(cfg.openai_api_key)
     krx = KRXIndex.load(cfg.krx_csv_path)
     try:
         report = await run_batch(
@@ -62,7 +80,7 @@ async def _cmd_inspect(args, cfg):
 
 async def _cmd_escalate(args, cfg):
     sb = await SupabaseSQL.from_env()
-    client = AsyncOpenAI(api_key=cfg.openai_api_key, max_retries=2, timeout=60.0)
+    client = _make_openai_client(cfg.openai_api_key)
     krx = KRXIndex.load(cfg.krx_csv_path)
     try:
         since = datetime.fromisoformat(args.since)
