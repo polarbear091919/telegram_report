@@ -57,6 +57,18 @@ UPDATE reports
  WHERE id=$1 AND tagging_status='processing'
 """
 
+# Operational cleanup: when a wrapper detects nonzero exit from a CLI run,
+# revert ONLY rows claimed by that specific worker_id. Scoped narrower than
+# STALE_LOCK_RECLAIM_SQL (which uses time TTL) so it cannot race a still-
+# running worker on the same machine. Returns affected ids for audit.
+RESET_WORKER_SQL = """
+UPDATE reports
+   SET tagging_status='pending', tagging_locked_at=NULL, tagging_worker_id=NULL
+ WHERE tagging_status='processing'
+   AND tagging_worker_id=$1
+RETURNING id
+"""
+
 # Note: in-scope, OOS, unreadable rows all share this UPDATE; payload semantics differ.
 UPDATE_SQL = """
 UPDATE reports
