@@ -11,7 +11,6 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 import asyncpg
-import pandas as pd
 from openai import AsyncOpenAI
 
 from langgraph_tagger.analytics.llm_summary import summary_store
@@ -153,6 +152,7 @@ async def analyze_stock(
             tasks2 = [
                 _process_diff_one(
                     rid=rid, row_meta=row_meta, curr_summary=curr_summary,
+                    stock_code=stock_code,
                     client=client, cfg=cfg, sb=sb, pool=pool, sem=sem2,
                 )
                 for rid, row_meta, curr_summary in target_rows
@@ -237,6 +237,7 @@ async def _process_diff_one(
     rid: int,
     row_meta: dict[str, Any],
     curr_summary: dict[str, Any],
+    stock_code: str,
     client: AsyncOpenAI,
     cfg: LLMSummaryConfig,
     sb,
@@ -245,10 +246,9 @@ async def _process_diff_one(
 ) -> None:
     try:
         async with sem:
-            stock_codes = row_meta.get('stock_codes') or []
-            stock_code = stock_codes[0] if stock_codes else None
-            if stock_code is None:
-                return  # 단일종목인데 stock_codes 비어있음 — 비정상, skip
+            # stock_code comes from analyze_stock's parameter — the stock the user is
+            # analyzing. For multi-stock rows (보통주+우선주 등), this ensures the diff
+            # cascade runs against the correct stock, not row_meta['stock_codes'][0].
             prev = await find_prev_for_diff_safe(
                 pool, stock_code=stock_code,
                 publisher=row_meta.get('publisher'),
