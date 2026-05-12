@@ -6,12 +6,18 @@ from config import Config, load_config
 
 
 def test_load_config_happy_path(monkeypatch):
+    # Block .env loading so the project's real .env (which sets some optional
+    # vars to non-default values) cannot leak into the assertion.
+    monkeypatch.setattr('config.load_dotenv', lambda *a, **k: False)
     monkeypatch.setenv('TELEGRAM_API_ID', '12345')
     monkeypatch.setenv('TELEGRAM_API_HASH', 'abcdef0123456789')
     monkeypatch.setenv('TELEGRAM_CHANNEL', 'sunstudy1004')
     monkeypatch.setenv('SUPABASE_URL', 'https://test.supabase.co')
     monkeypatch.setenv('SUPABASE_SERVICE_KEY', 'eyJtest')
-    # Don't set optional vars — they should pick up defaults
+    # Clear optional vars so defaults are exercised
+    for k in ('TELEGRAM_SESSION_NAME', 'STORAGE_BASE_DIR', 'INITIAL_CUTOFF_DAYS',
+              'MAX_CONCURRENT_DOWNLOADS', 'LOG_LEVEL', 'TELEGRAM_CHANNEL_ID'):
+        monkeypatch.delenv(k, raising=False)
 
     cfg = load_config()
 
