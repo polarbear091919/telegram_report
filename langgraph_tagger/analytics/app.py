@@ -12,7 +12,7 @@ from supabase import create_client
 from langgraph_tagger.analytics import favorites, krx
 from langgraph_tagger.analytics.config import load_analytics_config
 from langgraph_tagger.analytics.db import AnalyticsDB
-from langgraph_tagger.analytics.pages import macro, stock
+from langgraph_tagger.analytics.views import macro, stock
 
 
 st.set_page_config(page_title='Analytics Dashboard', layout='wide')
