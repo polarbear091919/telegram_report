@@ -8,7 +8,7 @@ import asyncio
 import logging
 from typing import Any, Literal
 
-from openai import APIConnectionError, APITimeoutError, RateLimitError, APIError
+from openai import APIConnectionError, APITimeoutError, RateLimitError
 
 from langgraph_tagger.analytics.llm_summary.prompts import (
     render_extraction_messages, render_diff_messages,
@@ -25,7 +25,8 @@ class TransientLLMError(RuntimeError):
 
 
 _TRANSIENT_TYPES = (
-    APIConnectionError, APITimeoutError, RateLimitError, TransientLLMError,
+    APIConnectionError, APITimeoutError, RateLimitError,
+    TransientLLMError, asyncio.TimeoutError,  # wait_for timeout
 )
 
 

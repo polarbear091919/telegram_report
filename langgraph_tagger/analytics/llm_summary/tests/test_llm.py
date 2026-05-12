@@ -90,6 +90,29 @@ async def test_extract_one_permanent_fail_raises():
 
 
 @pytest.mark.asyncio
+async def test_extract_one_retries_on_wait_for_timeout():
+    """asyncio.wait_for timeout이 transient로 분류되어 재시도."""
+    call_count = {'n': 0}
+    async def slow_then_succeeds(**kwargs):
+        call_count['n'] += 1
+        if call_count['n'] == 1:
+            # Simulate a hang that wait_for would catch
+            await asyncio.sleep(0.05)  # > timeout_s=0.01
+            return _fake_openai_response(_valid_extraction_obj())
+        return _fake_openai_response(_valid_extraction_obj())
+    fake = AsyncMock()
+    fake.beta.chat.completions.parse = slow_then_succeeds
+    r, _, _ = await extract_one(
+        client=fake, model='gpt-5.4-mini',
+        metadata={}, pages_text='',
+        timeout_s=0.01,  # First call exceeds; second is instant after sleep ended
+        backoff_s=0,
+    )
+    assert isinstance(r, ExtractionResult)
+    assert call_count['n'] == 2  # retried
+
+
+@pytest.mark.asyncio
 async def test_diff_one_happy_path():
     fake = AsyncMock()
     fake.beta.chat.completions.parse = AsyncMock(
