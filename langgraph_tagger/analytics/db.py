@@ -106,14 +106,17 @@ class AnalyticsDB:
     def fetch_stock_rows(self, code: str, period_start_iso: str) -> pd.DataFrame:
         """All in-scope rows where stock_codes contains the given code.
 
-        Uses Postgres array contains: .cs('stock_codes', '{<code>}').
+        Uses supabase-py's .contains() which builds a properly-quoted
+        Postgres text-array literal from a Python list. The earlier
+        .cs('stock_codes', f'{{{code}}}') produced an unquoted array
+        like {001440} which PostgREST parsed character-by-character.
         """
         chain = (
             self._sb.table('reports')
             .select(SELECT_COLS)
             .in_('tagging_status', ['auto', 'verified'])
             .is_('out_of_scope_reason', 'null')
-            .cs('stock_codes', f'{{{code}}}')
+            .contains('stock_codes', [code])
             .gte('published_at', period_start_iso)
         )
         rows = _paged_fetch(chain)
