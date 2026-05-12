@@ -75,21 +75,21 @@ class TelegramClient:
         await self._client.disconnect()
 
     async def iter_messages_after_id(
-        self, channel: str, min_id: int
+        self, channel: int | str, min_id: int
     ) -> AsyncIterator[Message]:
         """Yield messages with id > min_id, oldest first."""
         async for msg in self._client.iter_messages(channel, min_id=min_id, reverse=True):
             yield msg
 
     async def iter_messages_since_date(
-        self, channel: str, days_ago: int
+        self, channel: int | str, days_ago: int
     ) -> AsyncIterator[Message]:
         """First-run path: yield all messages since `days_ago` days ago, oldest first."""
         cutoff = datetime.now(timezone.utc) - timedelta(days=days_ago)
         async for msg in self._client.iter_messages(channel, offset_date=cutoff, reverse=True):
             yield msg
 
-    async def get_message_by_id(self, channel: str, message_id: int) -> Message | None:
+    async def get_message_by_id(self, channel: int | str, message_id: int) -> Message | None:
         """Fetch a single message by id. Returns None if deleted/not found."""
         return await self._client.get_messages(channel, ids=message_id)
 
