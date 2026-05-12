@@ -69,8 +69,12 @@ def _call_summary_store_update_diff(sb, **kwargs):
 
 @asynccontextmanager
 async def open_pool(db_url: str, max_size: int = 2):
-    """매 호출 새 pool 열고 닫음 — Streamlit rerun event loop mismatch 회피."""
-    pool = await asyncpg.create_pool(db_url, max_size=max_size)
+    """매 호출 새 pool 열고 닫음 — Streamlit rerun event loop mismatch 회피.
+
+    asyncpg default min_size=10 인데 우리 운영 ceiling은 max_size=2 (CLAUDE.md).
+    min_size>max_size이면 ValueError라서 min_size=1로 명시.
+    """
+    pool = await asyncpg.create_pool(db_url, min_size=1, max_size=max_size)
     try:
         yield pool
     finally:
