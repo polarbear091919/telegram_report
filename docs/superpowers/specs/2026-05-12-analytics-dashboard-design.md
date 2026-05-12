@@ -82,9 +82,9 @@ Single-page Streamlit app. `st.tabs` 또는 사이드바 분기로 모드 전환
 |---|---|
 | `app.py` | Streamlit entry. sidebar 렌더, main 모드 라우팅(매크로/종목), session_state 관리. |
 | `config.py` | `AnalyticsConfig` — viewer가 필요한 env만 (`SUPABASE_URL`, `SUPABASE_SERVICE_KEY`, `STORAGE_BASE_DIR`, `KRX_CSV_PATH`). review_viewer와 같은 분리 원칙 — 태거·collector envs 요구 안 함. |
-| `db.py` | Supabase 쿼리 wrapper. 5종 fetcher (모두 `@st.cache_data(ttl=180)`): `fetch_inscope_rows(period)` (raw rows), `fetch_inscope_or_oos_rows(period, include_oos)` (Report type volume용), `fetch_stock_rows(code, period)`, `fetch_stock_publisher_rows(code, period)`, `fetch_stock_report_list(code, period, limit, offset)`. **1000-row page loop 필수** — Supabase PostgREST의 기본 max는 1000 row이므로 `.range(offset, offset+999)` 반복으로 전부 가져옴. fetcher는 컬럼·기간 외엔 필터 안 함; 집계는 client-side. |
+| `db.py` | Supabase 쿼리 wrapper. 3종 fetcher: `fetch_inscope_rows(period)` (sector coverage), `fetch_inscope_or_oos_rows(period, include_oos)` (Report type volume), `fetch_stock_rows(code, period)` (stock dashboard). publisher 분포·리포트 리스트는 별도 fetcher 없이 `fetch_stock_rows`의 결과를 aggregate에서 가공해 cover. 캐시는 db.py 안이 아니라 호출 측(`pages/*.py`)에서 `@st.cache_data(ttl=180)` wrapper로 적용 — db.py 자체는 Streamlit runtime을 알 필요 없이 테스트 가능하게. **1000-row page loop 필수** — Supabase PostgREST 기본 max는 1000 row이므로 `.range(offset, offset+999)` 반복. fetcher는 컬럼·기간·종목 외엔 필터 안 함; 집계는 client-side. |
 | `aggregate.py` | pandas 집계 pure functions: `sector_timeseries(df, level, items, unit)`, `sector_ranking(df, items, level, limit)`, `report_type_timeseries(df, unit, include_oos)`, `stock_monthly(df, unit)`, `publisher_dist(df, top_k)`. 모두 DataFrame in, DataFrame out. unnest는 pandas `.explode()` 활용. |
-| `krx.py` | KRX 마스터 CSV 로딩(`@st.cache_data` once). `search_stocks(query)` — code 또는 회사명 부분일치 자동완성. `lookup(code) → (code, name, sector_major)`. |
+| `krx.py` | KRX 마스터 CSV 로딩(`@st.cache_data` once). 실제 CSV 헤더 `('종목\n코드', 종목명, 시장, 산업명(대), 산업명(중), 주요제품)`를 `(code, name, sector_major, sector_minor)`로 normalize. `search_stocks(query)` — code 또는 회사명 부분일치 자동완성. `lookup(code) → (code, name, sector_major, sector_minor)`. |
 | `favorites.py` | `load()` / `add(code)` / `remove(code)` — JSON 파일 read/write (`~/.review_viewer/favorites.json`). atomic write (tempfile + os.replace). 손상 시 backup 후 빈 리스트. |
 | `charts.py` | Plotly figure builder: `timeseries_line(df, x, y_cols, title)`, `report_type_lines(df, include_oos)`, `monthly_bar(df, x, y, title)`, `publisher_pie(df, label, value)`, `ranking_bar(df, label, value)`. |
 | `pages/macro.py` | 모드 1 렌더. 내부 sub-tab 2개: `sector_coverage_tab(session)`, `report_type_tab(session)`. |
@@ -93,7 +93,7 @@ Single-page Streamlit app. `st.tabs` 또는 사이드바 분기로 모드 전환
 | `tests/test_krx.py` | KRX search/lookup pure logic. |
 | `tests/test_favorites.py` | JSON read/write round-trip + 빈 파일 / 잘못된 JSON 복구. |
 | `tests/test_aggregate.py` | pandas 집계 함수 5종 단위 테스트 (작은 fixture df → 기대 출력). |
-| `tests/test_db.py` | 5종 fetcher mock 검증 — in-scope 필터 자동 적용 (단 `fetch_inscope_or_oos_rows`는 toggle 시 OOS 포함), 1000-row pagination loop 호출, cache 동작. |
+| `tests/test_db.py` | 3종 fetcher + OOS include 분기 + 1000-row pagination loop + `_to_frame`의 EXPECTED_COLS 보존 + `include_oos=True`의 client-side `effective_date` 필터 검증. cache는 호출 측 wrapper에서 적용되므로 db.py 테스트엔 무관. |
 | `tests/test_charts.py` | Plotly Figure 객체 type + 입력 컬럼 정합성. |
 
 UI 페이지(`app.py`, `pages/*.py`)는 manual smoke로 검증.
@@ -172,9 +172,15 @@ Sector coverage, Stock dashboard, 종목 검색 자동완성 빈도 등 모두 �
 
 `pending` / `processing` / `review_needed`는 어느 경우든 제외.
 
-### 발간일
+### 발간일과 `effective_date`
 
-DB `published_at` 컬럼 그대로 사용. 태거 [resolve_krx.py](/langgraph_tagger/nodes/resolve_krx.py)가 LLM 추출 발간일이 NULL일 때 `sent_at`의 KST date로 채워 [write.py](/langgraph_tagger/nodes/write.py)가 DB에 저장한다. 즉 DB의 `published_at`은 "태거 통합 발간일"이며 Phase 1에서는 source 구분 없이 그대로 사용. source flag 컬럼은 Phase 2에서 LLM 요약 백필 작업할 때 같이 추가(migration 005 후보).
+**In-scope 행**: 태거 [resolve_krx.py](/langgraph_tagger/nodes/resolve_krx.py)가 LLM 추출 발간일이 NULL이면 `sent_at`의 KST date로 `published_at_final`을 채워 [write.py](/langgraph_tagger/nodes/write.py)가 DB의 `published_at`에 저장. 따라서 in-scope 행의 `published_at`은 항상 채워져 있고 "태거 통합 발간일"로 그대로 사용 가능.
+
+**OOS 행**: writer의 OOS 분기는 `published_at = NULL`로 저장 ([write.py:20](/langgraph_tagger/nodes/write.py)). 즉 IR자료·foreign·private 등 OOS 행은 DB의 `published_at`이 NULL. 따라서 Report type volume sub-tab의 `include_oos=True` 모드에서는 server-side `published_at` 필터가 OOS 행을 silent하게 누락시킨다.
+
+**대응**: `aggregate._ensure_effective_date()`가 모든 시간 기준 집계 전에 `effective_date = published_at OR (sent_at을 KST date로 변환)` 컬럼을 derive. 시간 bucket·필터는 이 컬럼을 사용. OOS 모드의 server-side 필터는 제거하고 client-side `effective_date` 필터로 대체 (db.py의 `fetch_inscope_or_oos_rows(include_oos=True)` 분기).
+
+source flag 컬럼(어떤 행이 sent_at fallback이었는지 표시)은 Phase 2에서 LLM 요약 백필 작업할 때 같이 추가(migration 005 후보).
 
 ### 종목 매칭
 
@@ -205,18 +211,21 @@ weighted count, momentum, unique_publishers 등은 Future.
 
 모든 fetcher 패턴:
 ```python
-@st.cache_data(ttl=180)
-def fetch_inscope_rows(period: str) -> pd.DataFrame:
-    PAGE = 1000
+EXPECTED_COLS = (
+    'id', 'published_at', 'sent_at', 'report_type', 'publisher',
+    'stock_codes', 'company_names', 'sectors_major', 'sectors_minor',
+    'products', 'tagging_status', 'out_of_scope_reason', 'file_path',
+    'file_name', 'title',
+)
+PAGE = 1000
+
+def fetch_inscope_rows(sb, period_start_iso: str) -> pd.DataFrame:
     rows = []
     offset = 0
     while True:
         result = (
             sb.table('reports')
-              .select('id, published_at, sent_at, report_type, publisher, '
-                      'stock_codes, company_names, sectors_major, sectors_minor, '
-                      'products, tagging_status, out_of_scope_reason, file_path, '
-                      'file_name, title')
+              .select(', '.join(EXPECTED_COLS))
               .in_('tagging_status', ['auto', 'verified'])
               .is_('out_of_scope_reason', 'null')
               .gte('published_at', period_start_iso)
@@ -228,10 +237,18 @@ def fetch_inscope_rows(period: str) -> pd.DataFrame:
         if len(batch) < PAGE:
             break
         offset += PAGE
-    return pd.DataFrame(rows)
+    # columns=... 으로 빈 결과에서도 schema 유지 — 집계 측에서 KeyError 회피
+    return pd.DataFrame(rows, columns=list(EXPECTED_COLS))
 ```
 
-Report type volume sub-tab의 `fetch_inscope_or_oos_rows`는 `.in_('tagging_status', ['auto', 'verified'])`까지만 적용하고 `is_('out_of_scope_reason', 'null')`는 toggle에 따라 추가/생략.
+Report type volume의 `fetch_inscope_or_oos_rows(include_oos=True)`는 `.in_('tagging_status', ['auto','verified'])` 까지만 server-side에 두고 `is_('out_of_scope_reason','null')`과 `.gte('published_at', ...)`는 모두 생략. server-side 기간 필터를 떼는 이유는 OOS 행이 `published_at=NULL`이라 누락되기 때문. 대신 fetch 후 client-side로 `effective_date = published_at OR sent_at(KST date)`를 derive해 기간 필터를 적용한다 (aggregate.py `_ensure_effective_date`).
+
+캐시는 호출 측(`pages/*.py`)에서:
+```python
+@st.cache_data(ttl=180)
+def _fetch_inscope_cached(_db, period_start_iso):
+    return _db.fetch_inscope_rows(period_start_iso)
+```
 
 `ttl=180` (3분) — 운영자가 viewer 열어두고 종목 전환·sub-tab 전환 시 같은 필터는 cached 활용. 새 리서치 들어와도 3분 안에는 stale 가능 (수동 새로고침으로 비움).
 
@@ -259,13 +276,13 @@ In-scope row 수가 충분히 작아 클라이언트 메모리에 들어옴(전�
 | 상황 | 처리 |
 |---|---|
 | Supabase 연결 실패 | 화면 상단 `st.error` + 재시도 버튼 |
-| KRX_stocks_data.csv 없음 | `st.error("KRX 마스터 CSV가 없습니다: {path}")` + 검색·자동완성 동작 안 함. 매크로·즐겨찾기는 동작 |
+| KRX_stocks_data.csv 없음 | sidebar에 `st.warning("KRX 마스터 CSV가 없습니다 ...")` + 종목 검색·자동완성 비활성화. 매크로(Sector coverage·Report type volume 모두)와 즐겨찾기는 정상 동작 — ranking 표는 종목 code만 표시(name 없이), 종목 dashboard 헤더는 종목명을 '(unknown)'으로. main 영역 차단 안 함 |
 | 선택 종목이 데이터에 없음 | "이 종목 다룬 in-scope 리서치가 아직 없습니다" + 즐겨찾기 토글은 동작 |
 | 선택 산업이 데이터에 없음 | 매크로 시계열 빈 차트 + "선택한 산업의 데이터 없음" |
 | PDF 파일 missing | 발행 리스트의 PDF 버튼 비활성화 + 회색 표시 |
 | 즐겨찾기 파일 손상 | 빈 favorites fallback + `favorites.json.bak` 백업 |
 | 빈 즐겨찾기 | sidebar에 "★ 즐겨찾기는 종목 dashboard의 ★ 버튼으로 추가" |
-| Supabase pagination 중간 실패 | 부분 fetch된 rows로 차트 + 상단 warning(`st.warning`) "데이터 일부만 로드됨" |
+| Supabase pagination 중간 실패 | 화면 상단 `st.error` + "재시도" 버튼. 부분 fetch된 rows로 차트 그리지 않음 — 분석 도구에서 부분 데이터는 미스리딩 위험. fetcher가 예외를 그대로 전파, 호출 측 page에서 try/except로 처리 |
 | 데이터 fetch 5초 초과 | spinner(`st.spinner`) 표시. timeout 자체는 안 둠 |
 
 ## 11. Testing
