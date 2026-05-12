@@ -29,6 +29,21 @@ def _period_start_iso(label: str) -> str:
     return (datetime.now(timezone.utc) - timedelta(days=days)).date().isoformat()
 
 
+@st.cache_data(ttl=60)
+def _fetch_summaries_cached(_sb, ids_tuple: tuple[int, ...], active_version: str):
+    """Cached pre-click summary lookup. Streamlit reruns repeatedly on every
+    widget interaction (period dropdown, stock switch, etc.) — avoid hammering
+    Supabase REST. ttl=60 means stale-after-1-min is OK for "what's cached?" query.
+
+    Args:
+        _sb: supabase-py client (leading-underscore means st.cache_data treats it
+             as opaque/non-hashable). This is the @st.cache_data convention.
+        ids_tuple: tuple form so st.cache_data can hash it (lists aren't hashable).
+        active_version: cache invalidation key — bump version → cache_data miss.
+    """
+    return summary_store.fetch_summaries(_sb, list(ids_tuple), active_version)
+
+
 def _open_locally(pdf_path: Path) -> None:
     path_str = str(pdf_path)
     if sys.platform == 'win32':
@@ -43,6 +58,8 @@ def render(analytics_db, storage_base_dir: Path, stock_code: str) -> None:
     cfg = load_llm_summary_config()
     busy_key = f'llm_is_analyzing_{stock_code}'
     busy = st.session_state.get(busy_key, False)
+    # Note: Streamlit is single-threaded so analyze_stock blocks until done.
+    # `busy` flag is a defensive guard against future async-fire-and-forget patterns.
 
     # 상단 컨트롤
     col_period, col_button = st.columns([1, 2])
@@ -68,8 +85,8 @@ def render(analytics_db, storage_base_dir: Path, stock_code: str) -> None:
         return
 
     ids = single_df['id'].astype(int).tolist()
-    cached = summary_store.fetch_summaries(
-        analytics_db._sb, ids, cfg.summary_version,
+    cached = _fetch_summaries_cached(
+        analytics_db._sb, tuple(ids), cfg.summary_version,
     )
     cache_hit = len(cached)
     new_count = len(ids) - cache_hit
