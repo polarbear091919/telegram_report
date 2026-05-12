@@ -92,3 +92,58 @@ def test_load_config_max_concurrent_downloads_override(monkeypatch):
     cfg = load_config()
 
     assert cfg.max_concurrent_downloads == 8
+
+
+def test_load_config_telegram_channel_id_default_none(monkeypatch):
+    """CHANNEL_ID 환경변수 없으면 telegram_channel_id는 None."""
+    monkeypatch.setattr('config.load_dotenv', lambda *a, **k: False)
+    monkeypatch.setenv('TELEGRAM_API_ID', '12345')
+    monkeypatch.setenv('TELEGRAM_API_HASH', 'h')
+    monkeypatch.setenv('TELEGRAM_CHANNEL', 'sunstudy1004')
+    monkeypatch.setenv('SUPABASE_URL', 'u')
+    monkeypatch.setenv('SUPABASE_SERVICE_KEY', 'k')
+    monkeypatch.delenv('TELEGRAM_CHANNEL_ID', raising=False)
+
+    cfg = load_config()
+    assert cfg.telegram_channel_id is None
+
+
+def test_load_config_telegram_channel_id_int_when_set(monkeypatch):
+    """CHANNEL_ID 환경변수가 숫자 문자열이면 int로 캐스팅."""
+    monkeypatch.setattr('config.load_dotenv', lambda *a, **k: False)
+    monkeypatch.setenv('TELEGRAM_API_ID', '12345')
+    monkeypatch.setenv('TELEGRAM_API_HASH', 'h')
+    monkeypatch.setenv('TELEGRAM_CHANNEL', 'sunstudy1004')
+    monkeypatch.setenv('SUPABASE_URL', 'u')
+    monkeypatch.setenv('SUPABASE_SERVICE_KEY', 'k')
+    monkeypatch.setenv('TELEGRAM_CHANNEL_ID', '1378197756')
+
+    cfg = load_config()
+    assert cfg.telegram_channel_id == 1378197756
+    assert isinstance(cfg.telegram_channel_id, int)
+
+
+def test_channel_ref_returns_id_int_when_id_set(monkeypatch):
+    monkeypatch.setattr('config.load_dotenv', lambda *a, **k: False)
+    monkeypatch.setenv('TELEGRAM_API_ID', '12345')
+    monkeypatch.setenv('TELEGRAM_API_HASH', 'h')
+    monkeypatch.setenv('TELEGRAM_CHANNEL', 'sunstudy1004')
+    monkeypatch.setenv('SUPABASE_URL', 'u')
+    monkeypatch.setenv('SUPABASE_SERVICE_KEY', 'k')
+    monkeypatch.setenv('TELEGRAM_CHANNEL_ID', '1378197756')
+
+    cfg = load_config()
+    assert cfg.channel_ref() == 1378197756
+
+
+def test_channel_ref_falls_back_to_username_when_id_unset(monkeypatch):
+    monkeypatch.setattr('config.load_dotenv', lambda *a, **k: False)
+    monkeypatch.setenv('TELEGRAM_API_ID', '12345')
+    monkeypatch.setenv('TELEGRAM_API_HASH', 'h')
+    monkeypatch.setenv('TELEGRAM_CHANNEL', 'sunstudy1004')
+    monkeypatch.setenv('SUPABASE_URL', 'u')
+    monkeypatch.setenv('SUPABASE_SERVICE_KEY', 'k')
+    monkeypatch.delenv('TELEGRAM_CHANNEL_ID', raising=False)
+
+    cfg = load_config()
+    assert cfg.channel_ref() == 'sunstudy1004'
