@@ -83,6 +83,34 @@ async def test_open_pool_min_size_le_max_size(monkeypatch):
     assert kw['min_size'] >= 1
 
 
+@pytest.mark.asyncio
+async def test_open_pool_disables_statement_cache(monkeypatch):
+    """Supabase의 pgbouncer transaction mode는 prepared statement 캐시 안 됨.
+    asyncpg.create_pool에 statement_cache_size=0 명시 안 하면
+    `DuplicatePreparedStatementError: prepared statement "__asyncpg_stmt_X__"
+    already exists` 로 silent fail (transient 아니라 일반 Exception이라
+    pipeline._process_diff_one의 generic except에 잡혀서 row 업데이트 안 됨).
+
+    기존 태거 supabase_io.py:140이 동일 패턴.
+    """
+    from unittest.mock import AsyncMock, MagicMock
+    captured: dict = {}
+
+    async def fake_create_pool(*args, **kwargs):
+        captured['kwargs'] = kwargs
+        pool = MagicMock()
+        pool.close = AsyncMock()
+        return pool
+
+    monkeypatch.setattr('asyncpg.create_pool', fake_create_pool)
+
+    async with open_pool('postgres://test', max_size=2):
+        pass
+
+    assert captured['kwargs'].get('statement_cache_size') == 0, \
+        'open_pool must set statement_cache_size=0 (Supabase pgbouncer transaction mode)'
+
+
 from contextlib import asynccontextmanager
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock

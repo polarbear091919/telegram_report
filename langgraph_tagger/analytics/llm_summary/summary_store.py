@@ -6,7 +6,8 @@ asyncpg (raw SQL): find_prev_for_diff cascade (Task 9에서 추가).
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Literal, Optional
+from datetime import date
+from typing import Any, Literal, Optional, Union
 
 
 # ── REST (supabase-py) ─────────────────────────────────────────────────────
@@ -104,14 +105,20 @@ LIMIT 1;
 
 
 async def find_prev_for_diff(
-    pool,                              # asyncpg.Pool
+    pool,                                       # asyncpg.Pool
     stock_code: str,
     publisher: Optional[str],
-    current_published_at: str,         # ISO date string
+    current_published_at: Union[str, date],     # ISO str 또는 date 둘 다 OK
     active_version: str,
 ) -> Optional[PrevRow]:
     """같은 종목 이전 단일종목 in-scope 리포트 중 active 버전 summary를 가진
-    prev. 같은 발행처 우선, 없으면 발행처 무관 가장 최근. 둘 다 없으면 None."""
+    prev. 같은 발행처 우선, 없으면 발행처 무관 가장 최근. 둘 다 없으면 None.
+
+    asyncpg가 date 인자에 str을 받지 않으므로 ('toordinal' AttributeError),
+    ISO str으로 들어오면 내부에서 datetime.date로 변환.
+    """
+    if isinstance(current_published_at, str):
+        current_published_at = date.fromisoformat(current_published_at[:10])
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             _FIND_PREV_SQL,

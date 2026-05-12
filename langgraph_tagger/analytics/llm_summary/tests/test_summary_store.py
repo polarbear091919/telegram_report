@@ -159,6 +159,10 @@ async def test_find_prev_none():
 
 @pytest.mark.asyncio
 async def test_find_prev_passes_correct_sql_args():
+    """asyncpg는 date 인자에 str을 받지 않음 ('str object has no attribute toordinal').
+    find_prev_for_diff은 caller가 str을 줘도 내부에서 datetime.date로 변환해서
+    fetchrow에 넘겨야 함."""
+    from datetime import date
     pool = FakePool(fetchrow_result=None)
     await store.find_prev_for_diff(
         pool, stock_code='005930', publisher='삼성증권',
@@ -167,7 +171,22 @@ async def test_find_prev_passes_correct_sql_args():
     sql, args = pool.conn.queries[0]
     assert '005930' in args
     assert '삼성증권' in args
-    assert '2026-05-05' in args
+    assert date(2026, 5, 5) in args, \
+        f'published_at은 datetime.date여야 하는데 args={args}'
     assert 'llm-summary@1.0' in args
     assert 'INNER JOIN report_summaries' in sql
     assert 'r.published_at < ' in sql  # 같은 날짜 제외
+
+
+@pytest.mark.asyncio
+async def test_find_prev_accepts_date_object_too():
+    """ISO str과 date 객체 둘 다 받아야 함 (caller가 어느 형태로 줘도 OK)."""
+    from datetime import date
+    pool = FakePool(fetchrow_result=None)
+    await store.find_prev_for_diff(
+        pool, stock_code='005930', publisher='X',
+        current_published_at=date(2026, 5, 5),
+        active_version='llm-summary@1.0',
+    )
+    _, args = pool.conn.queries[0]
+    assert date(2026, 5, 5) in args

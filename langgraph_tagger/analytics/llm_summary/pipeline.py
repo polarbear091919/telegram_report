@@ -71,10 +71,18 @@ def _call_summary_store_update_diff(sb, **kwargs):
 async def open_pool(db_url: str, max_size: int = 2):
     """매 호출 새 pool 열고 닫음 — Streamlit rerun event loop mismatch 회피.
 
-    asyncpg default min_size=10 인데 우리 운영 ceiling은 max_size=2 (CLAUDE.md).
-    min_size>max_size이면 ValueError라서 min_size=1로 명시.
+    - asyncpg default min_size=10 인데 우리 운영 ceiling은 max_size=2.
+      min_size>max_size이면 ValueError라서 min_size=1로 명시.
+    - Supabase는 pgbouncer transaction mode를 쓰는 경우가 많아 prepared
+      statement 캐싱이 깨짐. statement_cache_size=0으로 비활성화.
+      (기존 태거 langgraph_tagger/supabase_io.py:136-141와 동일 패턴.)
     """
-    pool = await asyncpg.create_pool(db_url, min_size=1, max_size=max_size)
+    pool = await asyncpg.create_pool(
+        db_url,
+        min_size=1,
+        max_size=max_size,
+        statement_cache_size=0,
+    )
     try:
         yield pool
     finally:
