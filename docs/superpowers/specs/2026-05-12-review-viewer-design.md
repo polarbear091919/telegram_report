@@ -165,7 +165,7 @@ OOS도 `tagging_status='verified'`로 마감하는 이유: 사람이 검수해�
 
 ### Snapshot allowlist
 
-`actions.capture_snapshot(row)`이 `session.last_snapshot`에 보관하고 `restore_snapshot`이 UPDATE하는 컬럼은 다음 23개 (액션이 만질 수 있는 모든 컬럼):
+`actions.capture_snapshot(row)`이 `session.last_snapshot`에 보관하고 `restore_snapshot`이 UPDATE하는 컬럼은 다음 22개 (액션이 만질 수 있는 모든 컬럼):
 
 분석 본체: `published_at`, `report_type`, `publisher`, `publisher_type`, `analysts`, `title`, `stock_codes`, `company_names`, `stock_codes_raw`, `company_names_raw`, `sectors_major`, `sectors_minor`, `products`, `out_of_scope_reason`
 
