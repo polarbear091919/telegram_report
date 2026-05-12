@@ -40,11 +40,23 @@ def _open_locally(pdf_path: Path) -> None:
 
 
 def render(db, krx_df, storage_base_dir: Path, favorites_path: Path, session) -> None:
+    """Stock dashboard — 메타데이터 탭 (기존) + 🤖 LLM 분석 탭 (Phase 2)."""
     code = session.get('current_stock')
     if not code:
         st.warning('종목이 선택되지 않았습니다. sidebar의 검색 또는 즐겨찾기에서 선택해주세요.')
         return
 
+    tab_meta, tab_llm = st.tabs(['📋 메타데이터', '🤖 LLM 분석'])
+    with tab_meta:
+        _render_meta_view(db, krx_df, storage_base_dir, favorites_path, session, code)
+    with tab_llm:
+        from langgraph_tagger.analytics.llm_summary import tab as llm_tab
+        llm_tab.render(db, storage_base_dir, code)
+
+
+def _render_meta_view(db, krx_df, storage_base_dir: Path, favorites_path: Path,
+                      session, code: str) -> None:
+    """기존 메타데이터 view — 헤더 + 시계열 + publisher pie + 발행 리스트."""
     info = krx.lookup(krx_df, code) if krx_df is not None else None
     name = info[1] if info else '(unknown)'
     sector_major = info[2] if info else ''
