@@ -40,7 +40,7 @@ class ReviewDB:
             .eq('tagging_status', 'review_needed')
         )
         if skipped_list:
-            q = q.not_().in_('id', skipped_list)
+            q = q.not_.in_('id', skipped_list)
         q = q.order('tagged_at', desc=False).limit(1)
         result = q.execute()
         data = result.data or []
