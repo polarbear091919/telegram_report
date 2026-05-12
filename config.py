@@ -24,6 +24,18 @@ class Config:
     initial_cutoff_days: int
     max_concurrent_downloads: int
     log_level: str
+    telegram_channel_id: int | None = None
+
+    def channel_ref(self) -> int | str:
+        """Identifier for telethon fetch calls.
+
+        Returns the numeric channel id if set (required for private channels
+        with no public username), else falls back to the username string for
+        backward compatibility.
+        """
+        if self.telegram_channel_id is not None:
+            return self.telegram_channel_id
+        return self.telegram_channel
 
 
 def load_config() -> Config:
@@ -41,6 +53,12 @@ def load_config() -> Config:
 
     session_name = os.getenv('TELEGRAM_SESSION_NAME', 'samstudy')
 
+    def _optional_int(key: str) -> int | None:
+        v = os.getenv(key)
+        if v is None or v == '':
+            return None
+        return int(v)
+
     return Config(
         telegram_api_id=int(required('TELEGRAM_API_ID')),
         telegram_api_hash=required('TELEGRAM_API_HASH'),
@@ -52,4 +70,5 @@ def load_config() -> Config:
         initial_cutoff_days=int(os.getenv('INITIAL_CUTOFF_DAYS', '30')),
         max_concurrent_downloads=int(os.getenv('MAX_CONCURRENT_DOWNLOADS', '4')),
         log_level=os.getenv('LOG_LEVEL', 'INFO'),
+        telegram_channel_id=_optional_int('TELEGRAM_CHANNEL_ID'),
     )
