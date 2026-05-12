@@ -96,26 +96,31 @@ async def _dry_run(client, storage, config, backfill_days: int | None = None) ->
     from N days ago and skip ids already in reports OR failed_attempts.
     Reports separate counts of "new" vs "already-known skipped" so the
     user can size disk and time before launching the real run (spec §1.3).
+
+    Telegram fetch uses config.channel_ref(); storage lookups use the
+    chat_username label (config.telegram_channel) so existing rows are
+    deduped correctly.
     """
     from telegram_client import has_pdf, _get_original_filename
-    channel = config.telegram_channel
+    channel_ref = config.channel_ref()
+    chat_label = config.telegram_channel
 
     if backfill_days is not None:
-        existing_ids = storage.get_all_message_ids(channel)
-        existing_ids.update(storage.get_failed_message_ids(channel))
+        existing_ids = storage.get_all_message_ids(chat_label)
+        existing_ids.update(storage.get_failed_message_ids(chat_label))
         log.info(
             "DRY RUN (backfill mode): %d existing message_ids will be skipped, "
             "fetching from %d days ago",
             len(existing_ids), backfill_days,
         )
-        msgs = client.iter_messages_since_date(channel, backfill_days)
+        msgs = client.iter_messages_since_date(channel_ref, backfill_days)
     else:
         existing_ids = None
-        last_seen = storage.get_max_seen_message_id(channel)
+        last_seen = storage.get_max_seen_message_id(chat_label)
         if last_seen == 0:
-            msgs = client.iter_messages_since_date(channel, config.initial_cutoff_days)
+            msgs = client.iter_messages_since_date(channel_ref, config.initial_cutoff_days)
         else:
-            msgs = client.iter_messages_after_id(channel, last_seen)
+            msgs = client.iter_messages_after_id(channel_ref, last_seen)
 
     log.info("DRY RUN — would process the following:")
     n = 0
