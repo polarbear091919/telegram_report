@@ -4,7 +4,27 @@ Spec §8. 메인 함수 `analyze_stock`은 Task 11/12에서 추가.
 """
 from __future__ import annotations
 
+import asyncio
+import logging
+from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import Any, Callable, Optional
+
+import asyncpg
+import pandas as pd
+from openai import AsyncOpenAI
+
+from langgraph_tagger.analytics.llm_summary import summary_store
+from langgraph_tagger.analytics.llm_summary.config import (
+    LLMSummaryConfig, load_llm_summary_config, require_openai_key,
+)
+from langgraph_tagger.analytics.llm_summary.llm import (
+    diff_one, extract_one, TransientLLMError,
+)
+from langgraph_tagger.analytics.llm_summary.pdf_text import extract_all_pages
 from langgraph_tagger.analytics.llm_summary.schemas import ExtractionResult
+
+logger = logging.getLogger(__name__)
 
 
 def normalize_target_price_dir(r: ExtractionResult) -> ExtractionResult:
@@ -28,31 +48,10 @@ def normalize_target_price_dir(r: ExtractionResult) -> ExtractionResult:
     return r.model_copy(update={'target_price_dir': forced})
 
 
-import asyncio
-import logging
-from contextlib import asynccontextmanager
-from pathlib import Path
-from typing import Any, Callable, Optional
-
-import asyncpg
-import pandas as pd
-from openai import AsyncOpenAI
-
-from langgraph_tagger.analytics.llm_summary import summary_store
-from langgraph_tagger.analytics.llm_summary.config import (
-    LLMSummaryConfig, load_llm_summary_config, require_openai_key,
-)
-from langgraph_tagger.analytics.llm_summary.llm import (
-    diff_one, extract_one, TransientLLMError,
-)
-from langgraph_tagger.analytics.llm_summary.pdf_text import extract_all_pages
-
-logger = logging.getLogger(__name__)
-
-
 # ── wrappers (테스트 mock 용 — module 레벨 함수로 빼서 monkeypatch 쉽게) ─
 
 extract_one_safe = extract_one
+diff_one_safe = diff_one
 find_prev_for_diff_safe = summary_store.find_prev_for_diff
 
 
@@ -133,7 +132,36 @@ async def analyze_stock(
                 progress_cb(1, done, len(tasks))
 
         # Pass 2 — diff for rows where prev_match_type IS NULL or 'none'
-        # (added in Task 12)
+        # 재페치해서 최신 상태 가져옴 (Pass1에서 새로 들어온 row 포함)
+        fresh = summary_store.fetch_summaries(sb, report_ids, cfg.summary_version)
+        target_rows = []
+        for rid in report_ids:
+            row_meta = df[df['id'] == rid].iloc[0].to_dict()
+            summary_row = fresh.get(rid)
+            if summary_row is None:
+                continue  # Pass1 실패한 row — diff 시도 안 함
+            if summary_row.get('prev_match_type') in (None, 'none'):
+                target_rows.append((rid, row_meta, summary_row))
+
+        if target_rows:
+            sem2 = asyncio.Semaphore(cfg.max_concurrent)
+            if client is None:
+                # Pass1에서 client 안 만들었지만 Pass2는 LLM diff 필요할 수 있음
+                # — cascade hit 시에만 호출됨. lazy 검증.
+                api_key = require_openai_key(cfg)
+                client = AsyncOpenAI(api_key=api_key)
+            tasks2 = [
+                _process_diff_one(
+                    rid=rid, row_meta=row_meta, curr_summary=curr_summary,
+                    client=client, cfg=cfg, sb=sb, pool=pool, sem=sem2,
+                )
+                for rid, row_meta, curr_summary in target_rows
+            ]
+            done = 0
+            for coro in asyncio.as_completed(tasks2):
+                await coro
+                done += 1
+                progress_cb(2, done, len(tasks2))
 
     # Step D — final fetch + 카드 빌드
     final = summary_store.fetch_summaries(sb, report_ids, cfg.summary_version)
@@ -202,3 +230,53 @@ async def _process_extract_one(
         logger.warning("Extract permanent fail report_id=%d: %s", rid, e)
     except Exception as e:
         logger.exception("Extract unexpected error report_id=%d: %s", rid, e)
+
+
+async def _process_diff_one(
+    *,
+    rid: int,
+    row_meta: dict[str, Any],
+    curr_summary: dict[str, Any],
+    client: AsyncOpenAI,
+    cfg: LLMSummaryConfig,
+    sb,
+    pool,
+    sem: asyncio.Semaphore,
+) -> None:
+    try:
+        async with sem:
+            stock_codes = row_meta.get('stock_codes') or []
+            stock_code = stock_codes[0] if stock_codes else None
+            if stock_code is None:
+                return  # 단일종목인데 stock_codes 비어있음 — 비정상, skip
+            prev = await find_prev_for_diff_safe(
+                pool, stock_code=stock_code,
+                publisher=row_meta.get('publisher'),
+                current_published_at=str(row_meta['published_at']),
+                active_version=cfg.summary_version,
+            )
+            if prev is None:
+                _call_summary_store_update_diff(
+                    sb, report_id=rid, prev_report_id=None,
+                    match_type='none', narrative=None,
+                )
+                return
+
+            diff, _, _ = await diff_one_safe(
+                client=client, model=cfg.openai_model,
+                prev_summary=prev.summary, curr_summary=curr_summary,
+                prev_match_type=prev.match_type,
+                prev_report_id=prev.prev_report_id,
+                prev_publisher=prev.prev_publisher or '',
+                curr_publisher=row_meta.get('publisher') or '',
+                timeout_s=cfg.per_report_timeout_s,
+            )
+            _call_summary_store_update_diff(
+                sb, report_id=rid, prev_report_id=prev.prev_report_id,
+                match_type=prev.match_type, narrative=diff.diff_narrative,
+            )
+    except TransientLLMError as e:
+        # prev_match_type 그대로 NULL/none 유지 → 다음 클릭 Pass2 재시도
+        logger.warning("Diff transient fail report_id=%d: %s", rid, e)
+    except Exception as e:
+        logger.exception("Diff unexpected error report_id=%d: %s", rid, e)
