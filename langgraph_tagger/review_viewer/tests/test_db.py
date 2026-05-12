@@ -45,7 +45,7 @@ def test_fetch_next_review_excludes_skipped():
     chain = (client.table.return_value
                        .select.return_value
                        .eq.return_value
-                       .not_.return_value
+                       .not_
                        .in_.return_value
                        .order.return_value
                        .limit.return_value)
@@ -55,7 +55,7 @@ def test_fetch_next_review_excludes_skipped():
     row = db.fetch_next_review(skipped_ids={1, 2, 3})
 
     assert row['id'] == 7
-    not_in_args = client.table.return_value.select.return_value.eq.return_value.not_.return_value.in_.call_args
+    not_in_args = client.table.return_value.select.return_value.eq.return_value.not_.in_.call_args
     assert not_in_args.args[0] == 'id'
     assert set(not_in_args.args[1]) == {1, 2, 3}
 
