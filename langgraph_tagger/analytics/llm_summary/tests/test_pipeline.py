@@ -1,5 +1,5 @@
 from langgraph_tagger.analytics.llm_summary.pipeline import (
-    normalize_target_price_dir,
+    normalize_target_price_dir, open_pool,
 )
 from langgraph_tagger.analytics.llm_summary.schemas import ExtractionResult
 
@@ -45,6 +45,42 @@ def test_normalize_neither_forces_NA():
     r = _make(new=None, old=None, dir_='상향')  # LLM 잘못 추출
     out = normalize_target_price_dir(r)
     assert out.target_price_dir == 'N/A'
+
+
+# ── open_pool asyncpg sizing regression (smoke bug) ───────────────────────
+
+import pytest
+
+
+@pytest.mark.asyncio
+async def test_open_pool_min_size_le_max_size(monkeypatch):
+    """asyncpg.create_pool은 default min_size=10. 우리 max_size=2이면
+    ValueError. open_pool은 명시적으로 min_size <= max_size이어야 함.
+
+    이게 빠지면 manual smoke에서 "🤖 LLM 분석" 버튼 첫 클릭에서
+    `ValueError: min_size is greater than max_size`로 즉시 터짐.
+    """
+    from unittest.mock import AsyncMock, MagicMock
+    captured: dict = {}
+
+    async def fake_create_pool(*args, **kwargs):
+        captured['args'] = args
+        captured['kwargs'] = kwargs
+        pool = MagicMock()
+        pool.close = AsyncMock()
+        return pool
+
+    monkeypatch.setattr('asyncpg.create_pool', fake_create_pool)
+
+    async with open_pool('postgres://test', max_size=2) as pool:
+        assert pool is not None
+
+    kw = captured['kwargs']
+    assert 'min_size' in kw, \
+        'open_pool must set min_size (default 10 > our max_size=2 → ValueError)'
+    assert kw['min_size'] <= kw['max_size'], \
+        f"min_size={kw['min_size']} > max_size={kw['max_size']} (asyncpg ValueError)"
+    assert kw['min_size'] >= 1
 
 
 from contextlib import asynccontextmanager
