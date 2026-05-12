@@ -83,11 +83,30 @@ import pytest
 import asyncio
 
 
+def _make_dry_run_config(**overrides):
+    """Build a config-shaped object with channel_ref() for _dry_run tests."""
+    from types import SimpleNamespace
+
+    def channel_ref(self):
+        if getattr(self, 'telegram_channel_id', None) is not None:
+            return self.telegram_channel_id
+        return self.telegram_channel
+
+    defaults = dict(
+        telegram_channel='sunstudy1004',
+        telegram_channel_id=None,
+        initial_cutoff_days=30,
+    )
+    defaults.update(overrides)
+    ns = SimpleNamespace(**defaults)
+    ns.channel_ref = channel_ref.__get__(ns, SimpleNamespace)
+    return ns
+
+
 @pytest.mark.asyncio
 async def test_dry_run_with_backfill_uses_skip_set(monkeypatch, tmp_path, capsys):
     """_dry_run with backfill_days uses iter_since_date and skips IDs already
     in reports OR failed_attempts. The 'new' count should reflect dedupe."""
-    from types import SimpleNamespace
     from tests.conftest import FakeStorage, FakeTelegramClient, make_msg
     from main import _dry_run
 
@@ -99,10 +118,7 @@ async def test_dry_run_with_backfill_uses_skip_set(monkeypatch, tmp_path, capsys
     client = FakeTelegramClient()
     client.new_messages = [make_msg(100), make_msg(101), make_msg(200), make_msg(300)]
 
-    config = SimpleNamespace(
-        telegram_channel='sunstudy1004',
-        initial_cutoff_days=30,
-    )
+    config = _make_dry_run_config()
 
     rc = await _dry_run(client, storage, config, backfill_days=90)
 
@@ -116,3 +132,22 @@ async def test_dry_run_with_backfill_uses_skip_set(monkeypatch, tmp_path, capsys
     # Reports nothing was actually downloaded; nothing inserted; nothing saved
     assert storage.inserted == []
     assert storage.saved_files == []
+
+
+@pytest.mark.asyncio
+async def test_dry_run_uses_channel_id_when_set(tmp_path):
+    """When telegram_channel_id is set on config, dry-run fetches via int id."""
+    from tests.conftest import FakeStorage, FakeTelegramClient, make_msg
+    from main import _dry_run
+
+    storage = FakeStorage(base_dir=tmp_path)
+    client = FakeTelegramClient()
+    client.new_messages = [make_msg(125165)]
+
+    config = _make_dry_run_config(telegram_channel_id=1378197756)
+
+    rc = await _dry_run(client, storage, config, backfill_days=None)
+
+    assert rc == 0
+    # First run (max_seen=0) — uses iter_since_date with the int id
+    assert any(c[0] == 'iter_since_date' and c[1] == 1378197756 for c in client.calls)
