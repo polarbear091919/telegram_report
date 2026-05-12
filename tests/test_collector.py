@@ -11,13 +11,23 @@ from tests.conftest import FakeStorage, FakeTelegramClient, make_msg
 
 @pytest.fixture
 def cfg():
-    """Minimal config-shaped object."""
+    """Minimal config-shaped object. channel_ref() falls back to username
+    when telegram_channel_id is None (backward-compatible default)."""
     from types import SimpleNamespace
-    return SimpleNamespace(
+
+    def channel_ref(self):
+        if self.telegram_channel_id is not None:
+            return self.telegram_channel_id
+        return self.telegram_channel
+
+    ns = SimpleNamespace(
         telegram_channel='sunstudy1004',
+        telegram_channel_id=None,
         initial_cutoff_days=30,
         max_concurrent_downloads=4,
     )
+    ns.channel_ref = channel_ref.__get__(ns, SimpleNamespace)
+    return ns
 
 
 # === First-run behavior ===
@@ -195,18 +205,32 @@ async def test_run_returns_run_result_with_all_counters(fake_client, fake_storag
 
 # === Concurrency observation ===
 
+def _make_cfg(concurrency: int):
+    """Build a config-shaped object with channel_ref() that mirrors the cfg fixture."""
+    from types import SimpleNamespace
+
+    def channel_ref(self):
+        if self.telegram_channel_id is not None:
+            return self.telegram_channel_id
+        return self.telegram_channel
+
+    ns = SimpleNamespace(
+        telegram_channel='sunstudy1004',
+        telegram_channel_id=None,
+        initial_cutoff_days=30,
+        max_concurrent_downloads=concurrency,
+    )
+    ns.channel_ref = channel_ref.__get__(ns, SimpleNamespace)
+    return ns
+
+
 @pytest.mark.asyncio
 async def test_concurrency_respects_semaphore_limit(fake_storage):
     """With N=3 and 10 messages, max concurrent downloads should be at most 3
     AND at least 2 (proving real parallelism)."""
-    from types import SimpleNamespace
     from tests.conftest import TrackingFakeClient
 
-    cfg = SimpleNamespace(
-        telegram_channel='sunstudy1004',
-        initial_cutoff_days=30,
-        max_concurrent_downloads=3,
-    )
+    cfg = _make_cfg(concurrency=3)
     client = TrackingFakeClient()
     client.new_messages = [make_msg(100 + i) for i in range(10)]
 
@@ -221,14 +245,9 @@ async def test_concurrency_respects_semaphore_limit(fake_storage):
 @pytest.mark.asyncio
 async def test_concurrency_n1_is_serial(fake_storage):
     """With N=1 (Semaphore(1)), only one download at a time."""
-    from types import SimpleNamespace
     from tests.conftest import TrackingFakeClient
 
-    cfg = SimpleNamespace(
-        telegram_channel='sunstudy1004',
-        initial_cutoff_days=30,
-        max_concurrent_downloads=1,
-    )
+    cfg = _make_cfg(concurrency=1)
     client = TrackingFakeClient()
     client.new_messages = [make_msg(100 + i) for i in range(5)]
 
@@ -325,3 +344,38 @@ async def test_normal_mode_does_not_pre_fetch_existing_ids(
     assert result.processed == 1
     inserted_ids = [m['message_id'] for m in fake_storage.inserted]
     assert 101 in inserted_ids
+
+
+# === Channel id mode (private channels) ===
+
+@pytest.mark.asyncio
+async def test_id_mode_uses_int_for_fetch_but_username_for_db(
+    fake_client, fake_storage, cfg
+):
+    """When channel_id is set, telethon receives the int id, but
+    storage rows still use the human-readable chat_username label."""
+    cfg.telegram_channel_id = 1378197756
+    fake_client.new_messages = [make_msg(101)]
+
+    result = await run(fake_client, fake_storage, cfg)
+
+    # Fetch goes with the int id
+    assert any(c[0] == 'iter_since_date' and c[1] == 1378197756 for c in fake_client.calls)
+    # DB row keeps the string label (continuity with existing data)
+    assert result.processed == 1
+    assert fake_storage.inserted[0]['chat_username'] == 'sunstudy1004'
+
+
+@pytest.mark.asyncio
+async def test_id_mode_uses_int_for_after_id_fetch(
+    fake_client, fake_storage, cfg
+):
+    """In subsequent (last_seen > 0) mode, iter_after_id also gets the int id."""
+    cfg.telegram_channel_id = 1378197756
+    fake_storage._max_seen = 125164
+    fake_client.new_messages = [make_msg(125165)]
+
+    await run(fake_client, fake_storage, cfg)
+
+    assert any(c[0] == 'iter_after_id' and c[1] == 1378197756 for c in fake_client.calls)
+    assert fake_storage.inserted[0]['chat_username'] == 'sunstudy1004'

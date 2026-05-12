@@ -44,33 +44,39 @@ async def run(
       - Backfill mode (backfill_days=int): iterate from N days ago, skipping
         message_ids already in reports OR still in failed_attempts after Stage A.
 
+    Telegram fetch uses config.channel_ref() (int channel id for private
+    channels, or username str for public). DB rows always use
+    config.telegram_channel as the chat_username label so legacy and new
+    data live in the same namespace.
+
     Both stages share a single Semaphore so total concurrent downloads
     cannot exceed config.max_concurrent_downloads.
     """
     import asyncio
 
-    channel = config.telegram_channel
+    channel_ref = config.channel_ref()       # for telethon
+    chat_label = config.telegram_channel     # for storage (DB column)
     sem = asyncio.Semaphore(config.max_concurrent_downloads)
 
     # === Stage A: retry past failures (parallel) ===
-    failed_ids = storage.get_failed_message_ids(channel)
+    failed_ids = storage.get_failed_message_ids(chat_label)
     log.info("Stage A: retrying %d previously failed messages (concurrency=%d)",
              len(failed_ids), config.max_concurrent_downloads)
 
     async def retry_one(msg_id: int) -> str:
         async with sem:
-            msg = await client.get_message_by_id(channel, msg_id)
+            msg = await client.get_message_by_id(channel_ref, msg_id)
             if msg is None or not has_pdf(msg):
                 log.info("Cleaning failed_attempts row for msg_id=%s (deleted or not PDF)", msg_id)
-                storage.remove_failed_attempt(channel, msg_id)
+                storage.remove_failed_attempt(chat_label, msg_id)
                 return 'cleaned'
             try:
-                await _process_one_message(client, storage, channel, msg)
-                storage.remove_failed_attempt(channel, msg_id)
+                await _process_one_message(client, storage, chat_label, msg)
+                storage.remove_failed_attempt(chat_label, msg_id)
                 return 'success'
             except Exception as e:
                 log.exception("Retry still failing for msg_id=%s", msg_id)
-                new_count = storage.upsert_failed_attempt(channel, msg_id, str(e))
+                new_count = storage.upsert_failed_attempt(chat_label, msg_id, str(e))
                 if new_count >= ATTEMPT_WARN_THRESHOLD:
                     log.warning("msg_id=%s has failed %d times — investigate manually",
                                 msg_id, new_count)
@@ -86,32 +92,32 @@ async def run(
         # reports rows AND still-failing failed_attempts rows are both included.
         # Skipping the latter avoids double-processing the same msg_id in one run
         # (spec §3.3).
-        existing_ids = storage.get_all_message_ids(channel)
-        existing_ids.update(storage.get_failed_message_ids(channel))
+        existing_ids = storage.get_all_message_ids(chat_label)
+        existing_ids.update(storage.get_failed_message_ids(chat_label))
         log.info(
             "Backfill mode: %d existing message_ids will be skipped "
             "(reports + still-failed), fetching from %d days ago",
             len(existing_ids), backfill_days,
         )
-        message_iter = client.iter_messages_since_date(channel, backfill_days)
+        message_iter = client.iter_messages_since_date(channel_ref, backfill_days)
     else:
         existing_ids = None
-        last_seen = storage.get_max_seen_message_id(channel)
+        last_seen = storage.get_max_seen_message_id(chat_label)
         log.info("Stage B: last_seen_message_id=%s", last_seen)
         if last_seen == 0:
             log.info("First run; using cutoff=%d days", config.initial_cutoff_days)
-            message_iter = client.iter_messages_since_date(channel, config.initial_cutoff_days)
+            message_iter = client.iter_messages_since_date(channel_ref, config.initial_cutoff_days)
         else:
-            message_iter = client.iter_messages_after_id(channel, last_seen)
+            message_iter = client.iter_messages_after_id(channel_ref, last_seen)
 
     async def process_new(msg) -> str:
         async with sem:
             try:
-                await _process_one_message(client, storage, channel, msg)
+                await _process_one_message(client, storage, chat_label, msg)
                 return 'processed'
             except Exception as e:
                 log.exception("Failed to process message_id=%s", msg.id)
-                new_count = storage.upsert_failed_attempt(channel, msg.id, str(e))
+                new_count = storage.upsert_failed_attempt(chat_label, msg.id, str(e))
                 if new_count >= ATTEMPT_WARN_THRESHOLD:
                     log.warning("msg_id=%s has failed %d times — investigate manually",
                                 msg.id, new_count)
