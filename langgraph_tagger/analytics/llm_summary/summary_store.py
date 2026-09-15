@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date
+import json
 from typing import Any, Literal, Optional, Union
 
 
@@ -48,12 +49,14 @@ def update_diff(
     prev_report_id: Optional[int],
     match_type: Literal['same_publisher', 'cross_publisher', 'none'],
     narrative: Optional[str],
+    comparison_details: Optional[dict] = None,
 ) -> None:
     """Pass2 결과 — diff 필드만 부분 update."""
     sb.table('report_summaries').update({
         'prev_report_id': prev_report_id,
         'prev_match_type': match_type,
         'diff_narrative': narrative,
+        'comparison_details': comparison_details,
     }).eq('report_id', report_id).execute()
 
 
@@ -84,7 +87,8 @@ WITH eligible AS (
     s.positive_points,
     s.risk_points,
     s.target_price_raw,
-    s.recommendation_raw
+    s.recommendation_raw,
+    s.financial_details
   FROM reports r
   INNER JOIN report_summaries s
     ON s.report_id = r.id
@@ -130,12 +134,16 @@ async def find_prev_for_diff(
         'target_price_new', 'target_price_old', 'target_price_dir',
         'recommendation', 'recommendation_dir', 'one_line_summary',
         'positive_points', 'risk_points',
-        'target_price_raw', 'recommendation_raw',
+        'target_price_raw', 'recommendation_raw', 'financial_details',
     )
+    summary = {k: row.get(k) for k in summary_keys}
+    # asyncpg returns jsonb as JSON text without a custom codec.
+    if isinstance(summary['financial_details'], str):
+        summary['financial_details'] = json.loads(summary['financial_details'])
     return PrevRow(
         prev_report_id=row['prev_report_id'],
         prev_publisher=row['prev_publisher'],
         prev_published_at=row['prev_published_at'],
         match_type=row['match_type'],
-        summary={k: row[k] for k in summary_keys},
+        summary=summary,
     )

@@ -64,7 +64,89 @@ so total in-flight downloads stay bounded.
 - `1` Total failure (config / auth / network)
 - `2` Partial failure — some messages added to `failed_attempts` table; will be auto-retried next run
 
-## Development
+## Research Desk (React workspace)
+
+The new company research UI runs at **http://127.0.0.1:8520/**. It uses the
+existing Supabase reports, financial summaries, PDF files and favorites.
+
+```powershell
+.venv/Scripts/python.exe -m pip install -r requirements-workspace.txt
+pwsh -File scripts/start-workspace.ps1
+```
+
+Node.js 22.12+ (or 20.19+) is needed to build the frontend. The launcher installs
+frontend dependencies on first use, builds the UI and runs the local server.
+After building, `python -m langgraph_tagger.workspace` starts it directly.
+For frontend development, run `npm --prefix frontend run dev` alongside the
+Python server; Vite proxies `/api` to port 8520.
+
+- Search companies by name/code; reuse the existing favorites.
+- Browse all saved company reports with publisher, report type, period and analysis filters.
+- Explore industry/product coverage, report-type volume (including out-of-scope
+  material), company activity and publisher shares. Switch day/week/month, filter
+  periods, inspect the data table or export CSV.
+- Review the manual queue alongside the first three PDF pages: approve, mark
+  out-of-scope with a reason, queue retagging, skip, and undo the last action.
+- Open a report's summary, financial estimates, valuation and page-level sources.
+- Select any two reports for the same company and compare target prices,
+  compatible estimates, investment theses and valuations; open both PDFs together.
+- Check any number of single-company reports and click **선택한 N건 분석**.
+  Only those IDs are submitted; existing detailed analyses are reused. Progress
+  shows each result, supports stopping remaining work, and retries only failures.
+  Individual report analysis remains available. Two LLM calls at most run
+  concurrently within this server.
+
+Comparison numbers are calculated for the selected pair. A saved AI comparison
+narrative appears only when it belongs to that exact pair. Different publishers
+are labeled as differing views, and missing or incompatible estimates remain
+uncompared. A new comparison narrative runs only through the explicit button
+for the selected two reports; viewing or selecting reports never starts an LLM.
+
+This is a **local, single-user application** bound to `127.0.0.1`; Supabase and
+OpenAI credentials remain on the Python server. All former Streamlit dashboard
+and review functionality now lives here. The old `python -m langgraph_tagger.analytics`
+and `python -m langgraph_tagger.review_viewer` commands also launch Research Desk
+(coverage and review entry views, respectively).
+
+## Analysis models
+
+Tagging (`OPENAI_MODEL_DEFAULT`) and financial extraction/report comparison
+(`OPENAI_MODEL_PHASE2`) default to `gpt-5.6-luna`. Set both in `.env` to migrate
+an existing installation. Tagging escalation remains `gpt-5.4` via
+`OPENAI_MODEL_ESCALATION`. Restart running workers and the dashboard after changing
+these environment variables. Saved analyses keep their original model metadata
+and are reused; changing models does not trigger a bulk reanalysis.
+
+## Financial research details
+
+The stock dashboard's **🤖 LLM 분석** cards now include:
+
+- **실적 전망**: fiscal-period estimates, actuals/guidance, units, accounting basis,
+  explicitly reported prior estimates, and page-level evidence.
+- **밸류에이션**: valuation method, assumptions, target-price change drivers, and
+  the publisher's original recommendation labels and definitions.
+- **투자 논리·촉매**: claims, causal mechanisms, monitoring metrics, catalysts,
+  timing and conditions. Reconsideration conditions distinguish explicit source
+  statements from model-derived implications.
+- **보고서 비교**: same-publisher changes or cross-publisher differences, with
+  numerical comparisons only for matching periods, units, basis and scenarios.
+
+For an existing database, apply `migrations/006_financial_details.sql` once before
+running the updated application. It adds two nullable JSONB fields to the existing
+summary table. Existing basic summaries remain readable.
+
+Select a stock and period in `python -m langgraph_tagger.analytics`. New analyses
+extract financial details automatically. **금융 정보 확장** refreshes basic summaries
+in the selected period and also analyzes uncached reports; already expanded
+summaries are reused. The button shows the number of basic summaries affected.
+
+Numeric observations without support in their cited quote and PDF page are omitted.
+This check does not guarantee correct table-column alignment. Missing figures stay
+empty, and source evidence remains available for review. Comparisons use previously
+saved analyses; they do not claim complete market consensus. OCR, collection,
+tagging, market data and backtesting are outside this feature.
+
+## Development tests
 
 Run tests:
 

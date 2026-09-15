@@ -16,6 +16,8 @@ import streamlit as st
 
 from langgraph_tagger.analytics.llm_summary import pipeline, summary_store
 from langgraph_tagger.analytics.llm_summary.config import load_llm_summary_config
+from langgraph_tagger.analytics.llm_summary.financials import has_financial_details
+from langgraph_tagger.analytics.llm_summary.financial_view import render_financial_details
 
 
 PERIODS = {
@@ -90,6 +92,7 @@ def render(analytics_db, storage_base_dir: Path, stock_code: str) -> None:
     )
     cache_hit = len(cached)
     new_count = len(ids) - cache_hit
+    basic_count = sum(not has_financial_details(s) for s in cached.values())
 
     with col_button:
         st.caption(f'신규 분석 {new_count}건 · 캐시 {cache_hit}건')
@@ -98,9 +101,16 @@ def render(analytics_db, storage_base_dir: Path, stock_code: str) -> None:
             key=f'llm_btn_{stock_code}',
             use_container_width=True,
         )
+        expand_clicked = False
+        if basic_count:
+            expand_clicked = st.button(
+                f'금융 정보 확장 (기존 {basic_count}건)', disabled=busy,
+                key=f'financial_btn_{stock_code}', use_container_width=True,
+            )
+            st.caption('기존 기본 요약을 금융 정보로 확장하고, 아직 분석되지 않은 보고서도 함께 처리합니다.')
 
     # 분석 실행
-    if clicked:
+    if clicked or expand_clicked:
         st.session_state[busy_key] = True
         progress_box = st.empty()
         try:
@@ -117,7 +127,9 @@ def render(analytics_db, storage_base_dir: Path, stock_code: str) -> None:
                 period_start_iso=period_start_iso,
                 progress_cb=cb,
                 cfg=cfg,
+                refresh_financials=expand_clicked,
             ))
+            _fetch_summaries_cached.clear()
         finally:
             progress_box.empty()
             st.session_state[busy_key] = False
@@ -168,6 +180,7 @@ def _render_one_card(card: dict[str, Any], storage_base_dir: Path) -> None:
     )
     with st.expander(header, expanded=False):
         st.caption(f"📝 {s['one_line_summary']}")
+        render_financial_details(s)
         st.markdown('---')
 
         if s.get('positive_points'):
@@ -179,7 +192,7 @@ def _render_one_card(card: dict[str, Any], storage_base_dir: Path) -> None:
             for p in s['risk_points']:
                 st.markdown(f'- {p}')
 
-        if s.get('diff_narrative'):
+        if s.get('diff_narrative') and not has_financial_details(s):
             label = (
                 '🔄 동일 발행처 변동' if s.get('prev_match_type') == 'same_publisher'
                 else '📊 타 발행처 비교 (참고)'

@@ -17,7 +17,7 @@ def test_load_happy_path(monkeypatch):
     cfg = load_llm_summary_config()
 
     assert isinstance(cfg, LLMSummaryConfig)
-    assert cfg.openai_model == 'gpt-5.4-mini'
+    assert cfg.openai_model == 'gpt-5.6-luna'
     assert cfg.max_concurrent == 2
     assert cfg.per_report_timeout_s == 90
     assert cfg.max_input_tokens == 30000

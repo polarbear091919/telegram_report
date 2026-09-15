@@ -33,7 +33,69 @@ Extract these fields:
 - recommendation_raw: PDF에 등장한 원문 표기 (예: "BUY", "Trading Buy")
 - source_pages: 핵심 evidence가 등장한 페이지 번호 (1-indexed, max 10)
 - extraction_confidence: high / medium / low
+- financial_details: the structured financial research object described below.
 </task>
+
+<financial_details>
+Fill financial_details even when the report contains few financial facts. Use empty
+lists and nulls for missing content; do not invent facts to fill the schema.
+Extract only the subject company identified in metadata, not peers or subsidiaries'
+standalone results. Write explanations in Korean. Keep output concise.
+
+metrics: core financials (매출액, 영업이익, 순이익, EPS, BPS, ROE, 영업이익률),
+plus explicitly important sector KPIs. Prefer the forecast summary and revision
+tables; at most 48 observations. Canonicalize metric names consistently.
+- fiscal_period: explicit calendar period such as 2026, 2027, 2026Q2, or
+  2026Q1-Q3 YTD. Keep annual/quarterly/YTD/NTM distinct. Never label only FY1/FY2;
+  if the actual period cannot be established, use null.
+- value and previous_value: numeric values in the SAME stated unit. previous_value
+  is ONLY an explicitly shown former forecast for that EXACT period, accounting
+  basis, scenario and metric. Last year's actual is NOT the previous forecast.
+- unit: preserve the table's unit, e.g. 십억원, 억원, 원, %, 배. currency: KRW,
+  USD, etc., or null for non-monetary quantities. Do not silently rescale units.
+- accounting_basis: 연결 / 별도 / 미기재. Distinguish 실적 / 추정 / 가이던스.
+- scenario: 기본 for the report's central estimates; 낙관/비관 only when explicit;
+  otherwise 미기재. Never confuse peer-company values with the subject.
+- evidence: actual page and a short literal quote including table headers/units
+  where possible. Quote the source rather than reconstructing a statement.
+- The numeric value MUST appear literally in its evidence quote and on that page.
+  Do not calculate margins or reverse-calculate a previous estimate from a growth
+  rate. If previous_value is present, provide separate previous_evidence containing
+  BOTH the old and new number in the SAME row and its revision-table context.
+  Conflicting row labels across tables do not establish a comparable prior value.
+  Otherwise leave previous_value and previous_evidence null.
+- Do not mix fiscal-year BPS with 12M forward BVPS. NTM/12M Fwd belongs in its own
+  period, not the current calendar year. Use 2026 (not 2026E) for an annual 2026
+  forecast because value_type already records that it is an estimate.
+
+valuation: preserve the actual method (PER/PBR/EV/EBITDA/EV/Sales/DCF/SOTP/DDM/
+기타/미기재), target horizon, explanation, and key assumptions. For each assumption
+record current, explicitly stated previous value, fiscal period and evidence.
+change_drivers: only document-supported reasons for target price changes:
+실적 추정 변경, 배수 변경, 평가기간 변경, 할인율·자본비용 변경,
+주식수·순차입금·자산가치 변경, 기타. Do not assume a higher target implies improved
+earnings. Do not infer numerical attribution from EPS x PER for DCF/SOTP/PBR.
+If the cause is not stated, leave change_drivers empty.
+For 評価期間/평가기간 변경, previous_basis and current_basis must contain the
+explicit OLD and NEW evaluation periods. Merely stating '12M Fwd' does not prove
+the period changed. For other driver categories these fields may be null.
+
+theses: up to five claims with their causal mechanism. Distinguish 공시·실적,
+회사 가이던스, 애널리스트 추정 and 애널리스트 의견. monitoring_metric and
+invalidation_condition may be explicit or a direct qualitative implication of the
+stated mechanism. Mark invalidation_basis as 원문 명시 only if the quote actually
+states the condition; otherwise use 논리에서 도출. Use null and 미기재 when no clear
+condition can be given. Never invent numeric thresholds or the user's investment thesis.
+catalysts: dated events or identifiable triggers; expected_timing and condition
+are null when unstated. Preserve whether a date is expected/conditional.
+rating: preserve current_label and previous_label verbatim (e.g. Buy → Outperform),
+the publisher's actual definition and horizon if stated. Do not erase a downgrade
+merely because both labels map to the coarse 매수 category. Include evidence.
+
+Every metric, assumption, driver, thesis and catalyst needs its own evidence.
+Keep disclosed facts separate from forecasts and opinions. Do not transform
+generic disclosures into company-specific catalysts or risks.
+</financial_details>
 
 <normalization_rules>
 1. target_price_new / target_price_old: KRW int 변환 ("8만원" → 80000, "80,000원" → 80000).
@@ -99,6 +161,9 @@ what changed in their view:
 - macro or industry environment change
 - valuation method or target multiple change
 - newly emphasized risks or removed risks
+Use financial_details to discuss same-period earnings estimates, valuation
+assumptions, explicit rating labels, investment mechanisms and catalysts.
+Missing mention in a later report is not proof that an earlier thesis was withdrawn.
 """
 
 _DIFF_CROSS_PUB_TASK = """Compare two equity research reports from **different publishers** —
@@ -110,6 +175,9 @@ views**. Write a Korean narrative comparing how they differ in:
 - earnings outlook
 - key strengths each emphasizes
 - key risks each emphasizes
+Use financial_details when available. Different fiscal periods, units, accounting
+bases or scenarios are not directly comparable. Label this as disagreement between
+desks, never as an analyst revision or a market-wide consensus.
 Use language like "{prev_publisher}은 ... {curr_publisher}은 ..." or "이전 {prev_publisher} 리포트에선 ..., 이번 {curr_publisher} 리포트는 ...".
 DO NOT use language implying the same analyst revised their view.
 """
@@ -131,6 +199,9 @@ If there is no previous summary in input, return diff_narrative=null.
 - Prefer concrete changes over vague language.
 - Do not say "크게 변화했다" unless data supports it.
 - Do not invent numbers.
+- Compare only facts available in both inputs. If older financial_details are
+  absent, do not infer their estimates, valuation drivers or catalysts.
+- Prefer exact matching fiscal periods; never treat a FY rollover as an upgrade.
 </style_rules>
 """
 

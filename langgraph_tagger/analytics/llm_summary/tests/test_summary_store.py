@@ -190,3 +190,26 @@ async def test_find_prev_accepts_date_object_too():
     )
     _, args = pool.conn.queries[0]
     assert date(2026, 5, 5) in args
+
+
+@pytest.mark.asyncio
+async def test_find_prev_decodes_financial_jsonb():
+    pool = FakePool(fetchrow_result=FakeRecord({
+        'prev_report_id': 10, 'prev_publisher': 'X',
+        'prev_published_at': '2026-03-15', 'match_type': 'same_publisher',
+        'financial_details': '{"metrics": [{"metric": "EPS", "value": 100}]}',
+    }))
+    result = await store.find_prev_for_diff(
+        pool, stock_code='005930', publisher='X',
+        current_published_at='2026-05-05', active_version='llm-summary@1.0',
+    )
+    assert result.summary['financial_details']['metrics'][0]['value'] == 100
+
+
+def test_store_comparison_details():
+    sb = FakeSupabase()
+    store.update_diff(sb, report_id=3, prev_report_id=2,
+                      match_type='same_publisher', narrative='전망 상향',
+                      comparison_details={'metrics': [{'previous': 100, 'current': 120}]})
+    payload = next(c[1] for c in sb.last_query.calls if c[0] == 'update')
+    assert payload['comparison_details']['metrics'][0]['current'] == 120

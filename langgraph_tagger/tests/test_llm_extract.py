@@ -15,12 +15,13 @@ def _httpx_response(status: int) -> httpx.Response:
 
 
 @pytest.mark.asyncio
-async def test_happy_path_returns_parsed(mock_openai_client):
+@pytest.mark.parametrize("model", ["gpt-5.6-luna", "gpt-5.4"])
+async def test_happy_path_returns_parsed(mock_openai_client, model):
     extraction = make_llm_extraction()
     mock_openai_client.set_response(extraction)
 
     state = {
-        "model": "gpt-5.4-mini",
+        "model": model,
         "pdf_text": "샘플 텍스트",
         "file_name": "삼성전자_1Q26.pdf",
         "caption": None,
@@ -30,6 +31,12 @@ async def test_happy_path_returns_parsed(mock_openai_client):
 
     assert out["llm_raw"] == extraction
     assert "llm_refusal" not in out
+    kwargs = mock_openai_client.chat.completions.parse.call_args.kwargs
+    assert kwargs["model"] == model
+    if model == "gpt-5.6-luna":
+        assert "temperature" not in kwargs
+    else:
+        assert kwargs["temperature"] == 0
 
 
 @pytest.mark.asyncio

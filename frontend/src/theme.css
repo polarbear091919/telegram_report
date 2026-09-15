@@ -1,0 +1,20 @@
+/* Research Desk design tokens: light surfaces and readable research typography. */
+
+:root {
+  font-family: "DM Sans", "Noto Sans KR", sans-serif;
+  color: #202937;
+  background: #f7f8fa;
+  font-synthesis: none;
+  font-weight: 400;
+  --ink: #172432;
+  --muted: #586677;
+  --border: #dce2e8;
+  --accent: #166044;
+  --pale: #eef6f2;
+  --sidebar: 224px;
+  --text-body: #354658;
+  --text-secondary: #536274;
+  --text-green: #235b40;
+  --text-blue: #285a89;
+  --text-amber: #85512c;
+}

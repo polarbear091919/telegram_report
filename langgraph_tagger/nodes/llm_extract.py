@@ -34,7 +34,8 @@ async def llm_extract(state: RowState, *, client: AsyncOpenAI) -> dict:
                 )},
             ],
             response_format=LLMExtraction,
-            temperature=0,
+            # Luna rejects temperature=0; omit it to use the supported default.
+            **({} if state["model"].startswith("gpt-5.6-luna") else {"temperature": 0}),
         )
     except (RateLimitError, APITimeoutError, InternalServerError, ValidationError) as e:
         raise OpenAITransientError(str(e)) from e

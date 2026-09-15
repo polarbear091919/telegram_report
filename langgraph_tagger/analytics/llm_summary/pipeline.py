@@ -22,6 +22,9 @@ from langgraph_tagger.analytics.llm_summary.llm import (
 )
 from langgraph_tagger.analytics.llm_summary.pdf_text import extract_all_pages
 from langgraph_tagger.analytics.llm_summary.schemas import ExtractionResult
+from langgraph_tagger.analytics.llm_summary.financials import (
+    compare_financials, has_financial_details, ground_metrics,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -99,6 +102,7 @@ async def analyze_stock(
     period_start_iso: str,
     progress_cb: Callable[..., None],
     cfg: Optional[LLMSummaryConfig] = None,
+    refresh_financials: bool = False,
 ) -> list[dict[str, Any]]:
     cfg = cfg or load_llm_summary_config()
     sb = analytics_db._sb                # supabase-py REST client (analytics에서 재사용)
@@ -115,7 +119,9 @@ async def analyze_stock(
 
     # Step B — cache lookup
     cached = summary_store.fetch_summaries(sb, report_ids, cfg.summary_version)
-    miss_ids = [rid for rid in report_ids if rid not in cached]
+    miss_ids = [rid for rid in report_ids if rid not in cached or (
+        refresh_financials and not has_financial_details(cached[rid])
+    )]
 
     # Step C — OpenAI client는 cache miss가 있을 때만 필요 (lazy)
     if miss_ids:
@@ -151,7 +157,7 @@ async def analyze_stock(
             summary_row = fresh.get(rid)
             if summary_row is None:
                 continue  # Pass1 실패한 row — diff 시도 안 함
-            if summary_row.get('prev_match_type') in (None, 'none'):
+            if summary_row.get('prev_match_type') in (None, 'none') or rid in miss_ids:
                 target_rows.append((rid, row_meta, summary_row))
 
         if target_rows:
@@ -221,10 +227,16 @@ async def _process_extract_one(
                 timeout_s=cfg.per_report_timeout_s,
             )
             extracted = normalize_target_price_dir(extracted)
+            financial_payload = None
+            if extracted.financial_details is not None:
+                grounded, omitted = ground_metrics(extracted.financial_details, text)
+                financial_payload = grounded.model_dump()
+                financial_payload['unsupported_numeric_values'] = omitted
 
             payload = {
                 'report_id': rid,
                 **extracted.model_dump(),
+                'financial_details': financial_payload,
                 'input_truncated': truncated,
                 'input_pages_used': pages_used,
                 'input_total_pages': total_pages,
@@ -236,6 +248,7 @@ async def _process_extract_one(
                 'prev_report_id': None,
                 'prev_match_type': None,
                 'diff_narrative': None,
+                'comparison_details': None,
             }
             _call_summary_store_upsert(sb, payload)
     except TransientLLMError as e:
@@ -286,6 +299,12 @@ async def _process_diff_one(
             _call_summary_store_update_diff(
                 sb, report_id=rid, prev_report_id=prev.prev_report_id,
                 match_type=prev.match_type, narrative=diff.diff_narrative,
+                comparison_details={
+                    'previous_publisher': prev.prev_publisher,
+                    'previous_published_at': str(prev.prev_published_at),
+                    'metrics': compare_financials(prev.summary, curr_summary),
+                    'previous_has_financials': has_financial_details(prev.summary),
+                },
             )
     except TransientLLMError as e:
         # prev_match_type 그대로 NULL/none 유지 → 다음 클릭 Pass2 재시도

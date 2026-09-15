@@ -30,7 +30,7 @@ def load_llm_summary_config() -> LLMSummaryConfig:
         raise SystemExit("Missing required env var: SUPABASE_DB_URL")
 
     return LLMSummaryConfig(
-        openai_model=os.getenv('OPENAI_MODEL_PHASE2', 'gpt-5.4-mini'),
+        openai_model=os.getenv('OPENAI_MODEL_PHASE2', 'gpt-5.6-luna'),
         max_concurrent=int(os.getenv('PHASE2_MAX_CONCURRENT', '2')),
         per_report_timeout_s=int(os.getenv('PHASE2_PER_REPORT_TIMEOUT_S', '90')),
         max_input_tokens=int(os.getenv('PHASE2_MAX_INPUT_TOKENS', '30000')),

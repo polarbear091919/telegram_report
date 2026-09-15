@@ -1,5 +1,7 @@
 # Secrets - DO NOT COMMIT
 .env
+.env.*
+!.env.example
 *.session
 *.session-journal
 sessions/
@@ -20,3 +22,10 @@ venv/
 # IDE
 .idea/
 .vscode/
+.superpowers/
+frontend/node_modules/
+frontend/dist/
+.playwright-cli/
+output/playwright/
+.claude/
+graphify-out/cache/

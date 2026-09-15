@@ -7,6 +7,7 @@ from __future__ import annotations
 from typing import Literal, Optional
 
 from pydantic import BaseModel, Field, conint, model_validator
+from langgraph_tagger.analytics.llm_summary.financials import FinancialDetails
 
 
 TargetPriceDir       = Literal['상향', '불변', '하향', '신규', 'N/A']
@@ -18,6 +19,8 @@ PageNum = conint(ge=1)  # 1-indexed; 0/음수 reject
 
 
 class ExtractionResult(BaseModel):
+    # Nullable keeps existing summaries/fixtures readable. New extraction fills this.
+    financial_details: Optional[FinancialDetails] = None
     # 구조화 필드
     target_price_new:   Optional[int] = None
     target_price_old:   Optional[int] = None

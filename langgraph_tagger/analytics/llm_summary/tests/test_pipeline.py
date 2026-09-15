@@ -269,9 +269,43 @@ async def test_pass2_cascade_hit_writes_diff(monkeypatch, fake_pool, cfg,
         progress_cb=lambda *a, **k: None, cfg=cfg,
     )
     assert len(update_calls) == 1
+
     assert update_calls[0]['match_type'] == 'same_publisher'
     assert update_calls[0]['narrative'].startswith('vs 3/15')
     assert update_calls[0]['prev_report_id'] == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('refresh,expected_ids', [(False, []), (True, [1])])
+async def test_financial_expansion_only_refreshes_basic_summaries(
+    monkeypatch, fake_pool, cfg, mock_llm_extract, tmp_path, refresh, expected_ids,
+):
+    from langgraph_tagger.analytics.llm_summary.tests.test_financials import financial_details
+    cache = {
+        1: {'report_id': 1, 'prev_match_type': 'same_publisher', 'financial_details': None},
+        2: {'report_id': 2, 'prev_match_type': 'same_publisher',
+            'financial_details': financial_details()},
+    }
+    monkeypatch.setattr(pipeline.summary_store, 'fetch_summaries', lambda *a: dict(cache))
+    written = []
+
+    def save(sb, payload):
+        written.append(payload['report_id'])
+        cache[payload['report_id']] = payload
+
+    monkeypatch.setattr(pipeline, '_call_summary_store_upsert', save)
+    monkeypatch.setattr(pipeline, 'extract_pdf_pages', lambda *a: ('text', 1, 1, False))
+    monkeypatch.setattr(pipeline, 'find_prev_for_diff_safe', AsyncMock(return_value=None))
+    monkeypatch.setattr(pipeline, '_call_summary_store_update_diff', lambda *a, **k: None)
+    db = FakeAnalyticsDB(pd.DataFrame([_make_row(1), _make_row(2)]), MagicMock())
+    cards = await pipeline.analyze_stock(
+        analytics_db=db, storage_base_dir=tmp_path,
+        stock_code='005930', period_start_iso='2026-01-01',
+        progress_cb=lambda *a: None, cfg=cfg, refresh_financials=refresh,
+    )
+    assert written == expected_ids
+    assert len(cards) == 2
+    assert cache[2]['financial_details'] == financial_details()
 
 
 @pytest.mark.asyncio

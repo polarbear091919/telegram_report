@@ -38,7 +38,7 @@ def load_config() -> TaggerConfig:
         return v
     return TaggerConfig(
         openai_api_key=_req("OPENAI_API_KEY"),
-        model_default=os.environ.get("OPENAI_MODEL_DEFAULT", "gpt-5.4-mini"),
+        model_default=os.environ.get("OPENAI_MODEL_DEFAULT", "gpt-5.6-luna"),
         model_escalation=os.environ.get("OPENAI_MODEL_ESCALATION", "gpt-5.4"),
         max_concurrent_llm=int(os.environ.get("MAX_CONCURRENT_LLM", "10")),
         batch_size_default=int(os.environ.get("TAGGER_BATCH_SIZE_DEFAULT", "10")),
